@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from ..data import DataSamples
-from .._utils import color_background, add_suffix, rem_suffix
+from .._utils import color_background, add_suffix, rem_suffix, is_cross, cross_name, cross_split
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,6 +20,7 @@ from tqdm import tqdm
 from textwrap import wrap
 from concurrent import futures
 from functools import partial
+import json
 try:
     import optbinning
 except:
@@ -114,8 +115,8 @@ class WOE:
                 features = ds.features
             elif scorecard is not None:
                 features = list(scorecard['feature'].unique())
-        features = [rem_suffix(f) for f in features]
-        self.create_feature_woes(ds, features)
+        self.feature_woes = {rem_suffix(f): self.create_feature_woe(ds, rem_suffix(f)) for f in features if not is_cross(f)}
+        self.feature_crosses = {}
 
         if ds.samples is not None and (ds.time_column is not None or ds.id_column is not None):
             samples = {name: ds.samples[name][[f for f in [ds.time_column, ds.id_column] if f is not None]] for name in ds.samples}
@@ -129,34 +130,27 @@ class WOE:
         if scorecard is not None:
             self.import_scorecard(scorecard, verbose=False, fit_flag=False)
 
-    def create_feature_woes(self, ds, features=None):
+    def create_feature_woe(self, ds, f):
         """
-        Создает словарь self.feature_woes = {feature: FeatureWOE}
+        Создание объекта класса FeatureWOE
         :param ds: ДатаСэмпл для обработки
-        :param features: список переменных
+        :param f: переменная
+
+        :return: FeatureWOE
         """
-        if features is None:
-            features = ds.features
-        self.feature_woes = {}
-        for feature in features:
-            self.feature_woes[feature] = FeatureWOE(ds, feature, round_digits=self.round_digits, round_woe=self.round_woe,
-                                                    rounding_migration_coef=self.rounding_migration_coef,
-                                                    simple=self.simple, n_folds=self.n_folds,
-                                                    woe_adjust=self.woe_adjust, alpha=self.alpha,
-                                                    alpha_range=self.alpha_range,
-                                                    alpha_scoring=self.alpha_scoring,
-                                                    alpha_best_criterion=self.alpha_best_criterion,
-                                                    missing_process=self.missing_process,
-                                                    missing_min_part=self.missing_min_part,
-                                                    others_process=self.others,
-                                                    opposite_sign_to_others=self.opposite_sign_to_others,
-                                                    special_bins=self.special_bins)
+        return FeatureWOE(ds, f, round_digits=self.round_digits, round_woe=self.round_woe,
+                          rounding_migration_coef=self.rounding_migration_coef, simple=self.simple, n_folds=self.n_folds,
+                          woe_adjust=self.woe_adjust, alpha=self.alpha, alpha_range=self.alpha_range,
+                          alpha_scoring=self.alpha_scoring, alpha_best_criterion=self.alpha_best_criterion,
+                          missing_process=self.missing_process, missing_min_part=self.missing_min_part,
+                          others_process=self.others, opposite_sign_to_others=self.opposite_sign_to_others,
+                          special_bins=self.special_bins)
 
     def fit(self, features=None, new_groups=True, plot_flag=True, method='tree', max_n_bins=10, min_bin_size=0.05,
             criterion='entropy', scoring='neg_log_loss', max_depth=None, monotonic=False, solver='cp', divergence='iv'):
         """
         Пересчет биннинга для списка переменных
-        :param features: список переменных для обработки. При None обрабатываются все self.feature_woes
+        :param features: список переменных для обработки. При None обрабатываются list(self.feature_woes) + list(self.cross_features)
         :param new_groups: False - пересчитаются только WOE в биних,
                            True - также пересчитываются и границы бинов
         :param plot_flag: флаг для вывода графиков с биннингом
@@ -183,38 +177,70 @@ class WOE:
                         'js' - Jensen-Shannon,
                         'hellinger' - Hellinger divergence,
                         'triangular' - triangular discrimination
-         """
-
+        """
+        cross_features = self.cross_features
         if features is None:
-            features = list(self.feature_woes)
-        for feature in features:
-            self.feature_woes[feature].fit(new_groups=new_groups, method=method, max_n_bins=max_n_bins,
-                                           min_bin_size=min_bin_size, criterion=criterion, scoring=scoring,
-                                           max_depth=max_depth, monotonic=monotonic, solver=solver,
-                                           divergence=divergence)
+            features = list(self.feature_woes) + list(cross_features)
+        for f in features:
+            if f in self.feature_woes:
+                self.feature_woes[f].fit(new_groups=new_groups, method=method, max_n_bins=max_n_bins,
+                                         min_bin_size=min_bin_size, criterion=criterion, scoring=scoring,
+                                         max_depth=max_depth, monotonic=monotonic, solver=solver,
+                                         divergence=divergence)
+            elif f in cross_features:
+                f1, f2 = cross_split(f)
+                self.feature_crosses[f1].fit(cross_features=[f2], new_groups=new_groups, method=method, max_n_bins=max_n_bins,
+                                         min_bin_size=min_bin_size, criterion=criterion, scoring=scoring,
+                                         max_depth=max_depth, monotonic=monotonic, solver=solver,
+                                         divergence=divergence)
         if plot_flag:
             self.plot_bins(features=features, folder=None, plot_flag=True, show_groups=True)
 
     @staticmethod
-    def auto_fit_feature(feature_woe, auto_fit_parameters, verbose):
+    def get_f2_impurity(feature_woe, df1_group, criterion='entropy', max_depth=5, min_bin_size=0.05, max_n_bins=10):
+        impurity = 0
+        min_samples_leaf = min_bin_size if min_bin_size > 1 else int(round(len(df1_group) * min_bin_size, 0))
+        for group, df in feature_woe.ds.samples[feature_woe.ds.train_name].drop(['group'], axis=1) \
+                .merge(df1_group, how='left', left_index=True, right_index=True).groupby('group'):
+            df = df[~df[feature_woe.feature].isnull()]
+            if len(df) > min_samples_leaf* 2:
+                x_train = df[feature_woe.feature]
+                if feature_woe.categorical_type:
+                    groups = {group: [value] for group, value in enumerate(x_train.dropna().unique())}
+                    df['group'] = feature_woe.set_groups(data=x_train, groups=groups, inplace=False)
+                    x_train = df['group'].map(feature_woe.calc_simple_woes(df=df))
+                y_tran = df[feature_woe.ds.target]
+                try:
+                    tree = DecisionTreeClassifier(criterion=criterion, max_depth=max_depth, min_samples_leaf=min_samples_leaf,
+                                                  max_leaf_nodes=max_n_bins,
+                                                  random_state=feature_woe.ds.random_state)
+                    tree.fit(x_train[:, None], y_tran)
+                    impurity += sum(tree.tree_.impurity)
+                except:
+                    pass
+        return impurity
+
+    @staticmethod
+    def auto_fit_feature(feature_obj, auto_fit_parameters, verbose):
         """
         Автобиннинг одной переменной
-        :param feature_woe: объект класса FeatureWOE
+        :param feature_obj: объект класса FeatureWOE или FeatureCross
         :param auto_fit_parameters: словарь с параметрами атвобиннинга
         :param verbose: флаг для вывода подробных комментариев в процессе работы
 
         :return: флаг успешного завершения, список из датафреймов с логами
         """
-        return feature_woe.auto_fit(verbose=verbose, **auto_fit_parameters)
+        return feature_obj.auto_fit(verbose=verbose, **auto_fit_parameters)
 
     def auto_fit(self, features=None, autofit_folder='auto_fit', plot_flag=-1, verbose=False,
                  params_space=None, woe_best_samples=None, method='opt', max_n_bins=10, min_bin_size=0.05,
                  criterion='entropy', scoring='neg_log_loss', max_depth=5, solver='cp', divergence='iv',
                  WOEM_on=True, WOEM_woe_threshold=0.05, WOEM_with_missing=False,
-                 SM_on=True, SM_target_threshold=5, SM_size_threshold=100,
-                 BL_on=True, BL_allow_Vlogic_to_increase_gini=100,
-                 G_on=True, G_gini_threshold=5, G_with_test=False, G_gini_decrease_threshold=0.2, G_gini_increase_restrict=True,
-                 WOEO_on=False, WOEO_dr_threshold=0.01, WOEO_correct_threshold=0.85, WOEO_miss_is_incorrect=True, WOEO_with_test=False):
+                 SM_on=False, SM_target_threshold=5, SM_size_threshold=100,
+                 BL_on=True, BL_allow_Vlogic_to_increase_gini=15,
+                 G_on=False, G_gini_threshold=5, G_with_test=False, G_gini_decrease_threshold=0.2, G_gini_increase_restrict=True,
+                 WOEO_on=False, WOEO_dr_threshold=0.01, WOEO_correct_threshold=0.85, WOEO_miss_is_incorrect=True, WOEO_with_test=False,
+                 cross_features_first_level=None, cross_num_second_level=0):
         """
         Поиск оптимального биннинга, удовлетворяющего набору проверок. Итерационно для каждой переменной выполняются следующие шаги:
             1) Исходное разбиение на n бинов, где n на первой итерации равно max_n_bins
@@ -240,7 +266,7 @@ class WOE:
                                 Если min_bin_size < 1, то трактуется как доля наблюдений от обучающей выборки
 
         --- Параметры биннинга для метода 'tree' ---
-        :param criterion: критерий расщепления. Варианты значений: 'entropy', 'gini'
+        :param criterion: критерий расщепления. Варианты значений: 'entropy', 'gini', 'log_loss'
         :param scoring: метрика для оптимизации
         :param max_depth: максимальная глубина дерева
 
@@ -285,83 +311,126 @@ class WOE:
         :param params_space: пространство параметров, с которыми будут выполнены автобиннинги.
                 Задается в виде словаря {параметр: список значений}
         :param woe_best_samples: список сэмплов, джини которых будет учитываться при выборе лучшего биннинга.  При None берется джини на трэйне
+
+        --- Кросс переменные ---
+        :param cross_features_first_level: список переменных первого уровня для которых будут искаться лучшие кросс пары. При None берется features
+        :param cross_num_second_level: кол-во кросс пар, рассматриваемых для каждой переменной первого уровня
+                                           0 - поиск не производится
+                                           -1 - рассматриваются все возможные кросс пары
+                                           n - для каждой переменной первого уровня отбираются n лучших переменных с максимальной метрикой criterion
         """
 
         # feature_log, feature_gini, feature_bl, feature_woe, feature_er, woe_out
-        def save_res_file(df, i, writer):
+        def save_check_dfs(dfs, woe_best_samples, check_file):
             def transparent(x):
                 if pd.isnull(x):
                     return 'background-color: transparent'
-            if df.empty:
-                return
-            if i == 0:
-                df.to_excel(writer, sheet_name='Log', index=False)
-                worksheet = writer.sheets['Log']
-                worksheet.column_dimensions['A'].width = 40
-                worksheet.column_dimensions['B'].width = 12
-                worksheet.column_dimensions['C'].width = 12
-                worksheet.column_dimensions['D'].width = 12
-                worksheet.column_dimensions['E'].width = 60
-            elif i == 1:
-                df.to_excel(writer, sheet_name='Business Logic', index=False)
-                worksheet = writer.sheets['Business Logic']
-                worksheet.column_dimensions['A'].width = 40
-                for cn in range(2, worksheet.max_column + 1):
-                    worksheet.column_dimensions[openpyxl.utils.get_column_letter(cn)].width = 15
-                worksheet.freeze_panes = worksheet['C2']
-            elif i == 2:
-                gini_columns = [x for x in df.columns if x not in ['feature', 'iteration', 'Bootstrap std']]
-                df.style.apply(color_background,  mn=df[gini_columns].min().min(), mx=df[gini_columns].max().max(),
-                               cmap='RdYlGn', subset=pd.IndexSlice[:, gini_columns]).applymap(lambda x: transparent(x))\
-                    .to_excel(writer, sheet_name='Gini by Samples', index=False, float_format=f'%0.{self.round_woe}f')
-                worksheet = writer.sheets['Gini by Samples']
 
-                worksheet.column_dimensions['A'].width = 40
-                worksheet.column_dimensions['B'].width = 12
-                for cn in range(3, worksheet.max_column + 1):
-                    cl = openpyxl.utils.get_column_letter(cn)
-                    worksheet.column_dimensions[cl].width = 15
-                worksheet.freeze_panes = worksheet['C2']
-            elif i == 3:
-                woe_er_columns = [x for x in df.columns if x not in ['feature', 'iteration', 'group']]
-                woes_values = df[woe_er_columns].values.reshape(-1, ).tolist()
-                df.style.apply(color_background,
-                             mn=np.mean(woes_values) - 2 * np.std(woes_values),
-                             mx=np.mean(woes_values) + 2 * np.std(woes_values),
-                             cmap='RdYlGn',
-                             subset=woe_er_columns).to_excel(writer, sheet_name='WoE by Samples', index=False, float_format=f'%0.{self.round_woe}f')
-                worksheet = writer.sheets['WoE by Samples']
-                worksheet.column_dimensions['A'].width = 40
-                worksheet.column_dimensions['B'].width = 12
-                worksheet.column_dimensions['C'].width = 12
-                for cn in range(4, worksheet.max_column + 1):
-                    cl = openpyxl.utils.get_column_letter(cn)
-                    worksheet.column_dimensions[cl].width = 12
-                worksheet.freeze_panes = worksheet['D2']
-            elif i == 4:
-                woe_er_columns = [x for x in df.columns if x not in ['feature', 'iteration', 'group']]
-                er_values = df[woe_er_columns].values.reshape(-1, ).tolist()
-                df.style.apply(color_background,
-                            mn=max([0, np.mean(er_values) - 2 * np.std(er_values)]),
-                            mx=np.mean(er_values) + 2 * np.std(er_values),
-                            cmap='RdYlGn_r',
-                            subset=woe_er_columns).to_excel(writer, sheet_name='Event Rate by Samples', index=False)
-                worksheet = writer.sheets['Event Rate by Samples']
-                worksheet.column_dimensions['A'].width = 40
-                worksheet.column_dimensions['B'].width = 12
-                worksheet.column_dimensions['C'].width = 12
-                for cn in range(4, worksheet.max_column + 1):
-                    cl = openpyxl.utils.get_column_letter(cn)
-                    worksheet.column_dimensions[cl].width = 12
-                    for cell in worksheet[cl]:
-                        cell.number_format = '0.000%'
-                worksheet.freeze_panes = worksheet['D2']
-            elif i == 6:
-                df.to_excel(writer, sheet_name='Params')
-                worksheet = writer.sheets['Params']
-                worksheet.column_dimensions['A'].width = 40
-                worksheet.column_dimensions['B'].width = 20
+            def save_res_file(df, i, writer):
+                fix_columns = ['bin1', 'feature1', 'feature', 'iteration', 'group', 'Bootstrap std']
+                if df.empty:
+                    return None
+                if i == 0:
+                    df.to_excel(writer, sheet_name='Log', index=False)
+                    worksheet = writer.sheets['Log']
+                    worksheet.column_dimensions['A'].width = 40
+                    worksheet.column_dimensions['B'].width = 12
+                    worksheet.column_dimensions['C'].width = 12
+                    worksheet.column_dimensions['D'].width = 12
+                    worksheet.column_dimensions['E'].width = 60
+                elif i == 1:
+                    df.to_excel(writer, sheet_name='Business Logic', index=False)
+                    worksheet = writer.sheets['Business Logic']
+                    worksheet.column_dimensions['A'].width = 40
+                    for cn in range(2, worksheet.max_column + 1):
+                        worksheet.column_dimensions[openpyxl.utils.get_column_letter(cn)].width = 15
+                    worksheet.freeze_panes = worksheet['C2']
+                elif i == 2:
+                    gini_columns = [x for x in df.columns if x not in fix_columns]
+                    df.style.apply(color_background, mn=df[gini_columns].min().min(), mx=df[gini_columns].max().max(),
+                                   cmap='RdYlGn', subset=pd.IndexSlice[:, gini_columns]).applymap(
+                        lambda x: transparent(x)) \
+                        .to_excel(writer, sheet_name='Gini by Samples', index=False,
+                                  float_format=f'%0.{self.round_woe}f')
+                    worksheet = writer.sheets['Gini by Samples']
 
+                    worksheet.column_dimensions['A'].width = 40
+                    worksheet.column_dimensions['B'].width = 12
+                    for cn in range(3, worksheet.max_column + 1):
+                        cl = openpyxl.utils.get_column_letter(cn)
+                        worksheet.column_dimensions[cl].width = 15
+                    worksheet.freeze_panes = worksheet['C2']
+                elif i == 3:
+                    woe_er_columns = [x for x in df.columns if x not in fix_columns]
+                    woes_values = df[woe_er_columns].values.reshape(-1, ).tolist()
+                    df.fillna(0).style.apply(color_background,
+                                   mn=np.mean(woes_values) - 2 * np.std(woes_values),
+                                   mx=np.mean(woes_values) + 2 * np.std(woes_values),
+                                   cmap='RdYlGn',
+                                   subset=woe_er_columns).to_excel(writer, sheet_name='WoE by Samples', index=False,
+                                                                   float_format=f'%0.{self.round_woe}f')
+                    worksheet = writer.sheets['WoE by Samples']
+                    worksheet.column_dimensions['A'].width = 40
+                    worksheet.column_dimensions['B'].width = 12
+                    worksheet.column_dimensions['C'].width = 12
+                    for cn in range(4, worksheet.max_column + 1):
+                        cl = openpyxl.utils.get_column_letter(cn)
+                        worksheet.column_dimensions[cl].width = 12
+                    worksheet.freeze_panes = worksheet['D2']
+                elif i == 4:
+                    woe_er_columns = [x for x in df.columns if x not in fix_columns]
+                    er_values = df[woe_er_columns].values.reshape(-1, ).tolist()
+                    df.fillna(0).style.apply(color_background,
+                                   mn=max([0, np.mean(er_values) - 2 * np.std(er_values)]),
+                                   mx=np.mean(er_values) + 2 * np.std(er_values),
+                                   cmap='RdYlGn_r',
+                                   subset=woe_er_columns).to_excel(writer, sheet_name='Event Rate by Samples', index=False)
+                    worksheet = writer.sheets['Event Rate by Samples']
+                    worksheet.column_dimensions['A'].width = 40
+                    worksheet.column_dimensions['B'].width = 12
+                    worksheet.column_dimensions['C'].width = 12
+                    for cn in range(4 if 'bin1' not in df.columns else 5, worksheet.max_column + 1):
+                        cl = openpyxl.utils.get_column_letter(cn)
+                        worksheet.column_dimensions[cl].width = 12
+                        for cell in worksheet[cl]:
+                            cell.number_format = '0.000%'
+                    worksheet.freeze_panes = worksheet['D2']
+                elif i == 6:
+                    df.to_excel(writer, sheet_name='Params')
+                    worksheet = writer.sheets['Params']
+                    worksheet.column_dimensions['A'].width = 40
+                    worksheet.column_dimensions['B'].width = 20
+
+            f_gini = {}
+            Vlogic_features = set()
+            if dfs:
+                with pd.ExcelWriter(check_file, engine="openpyxl") as writer, \
+                     pd.ExcelWriter(check_file[:-5] + '_all.xlsx', engine="openpyxl") as writer_all:
+                    for i in range(5):
+                        res_dfs = [dfs[f][i] for f in dfs if dfs[f]]
+                        if not res_dfs:
+                            continue
+                        res_df = pd.concat(res_dfs).reset_index(drop=True)
+                        if 'feature1' in res_df.columns:
+                            group_columns = ['feature1', 'bin1', 'feature']
+                        else:
+                            group_columns = ['feature']
+                        save_res_file(res_df, i, writer_all)
+                        if not res_df.empty:
+                            if 'iteration' in res_df.columns:
+                                res_df = res_df[res_df.groupby(group_columns)['iteration'].transform('max') == res_df['iteration']]
+                            save_res_file(res_df, i, writer)
+                            if i == 1:
+                                Vlogic_features = set(res_df[res_df['trend_type'] == 'V-shape']['feature'].values)
+                            if i == 2:
+                                #res_df = res_df[res_df['feature'].isin([f for f in features if self.feature_woes[f].is_active])]
+                                f_gini = res_df.set_index(group_columns).round(self.round_woe)[[f for f in woe_best_samples if f in res_df.columns]].mean(axis=1).to_dict()
+                    df_params = pd.DataFrame().from_dict(auto_fit_parameters, orient='index', columns=['value'])
+                    save_res_file(df_params, 6, writer)
+                    save_res_file(df_params, 6, writer_all)
+            return f_gini, Vlogic_features
+
+        print(f"\n{' SFA ':-^150}\n")
         autofit_folder = autofit_folder.rstrip('/')
         folder = self.ds_aux.result_folder + autofit_folder + '/'
         if not os.path.exists(folder):
@@ -369,6 +438,8 @@ class WOE:
 
         if features is None:
             features = list(self.feature_woes)
+        cross_features = [f for f in features if is_cross(f)]
+        features = [f for f in features if not is_cross(f)]
         auto_fit_parameters = {}
         for f in ['method', 'max_n_bins', 'min_bin_size', 'criterion', 'scoring', 'max_depth', 'solver', 'divergence',
                   'WOEM_on',  'WOEM_woe_threshold', 'WOEM_with_missing', 'SM_on', 'SM_target_threshold', 'SM_size_threshold',
@@ -380,105 +451,185 @@ class WOE:
             params_space = {k: [v] for k, v in auto_fit_parameters.items()}
         params_names = list(params_space.keys())
         params_list = list(itertools.product(*params_space.values()))
-        print(f'Performing autobinning with parameters space of size {len(params_list)}...')
         file_scorecard = f'{self.ds_aux.result_folder}{autofit_folder}_scorecard.xlsx'
-        # check_dfs = {num_i: {feature: [feature_log, feature_bl, feature_gini, feature_woe, feature_er, woe_out]}}
-        check_dfs = {}
-        df_feature_gini = pd.DataFrame()
-        f_gini = {}
-        Vlogic_features = {}
-        for num_p, param in enumerate(params_list, start=1):
-            auto_fit_parameters.update({params_names[k]: param[k] for k in range(len(param))})
-            print(f'Using parameters set {num_p}/{len(params_list)}: {auto_fit_parameters}')
-            for p in ['SM_target_threshold', 'SM_size_threshold']:
-                if auto_fit_parameters[p] and auto_fit_parameters[p] < 1:
-                    auto_fit_parameters[p] = int(round(len(self.ds_aux.samples[self.ds_aux.train_name]) * auto_fit_parameters[p], 0))
-            Vlogic_features[num_p] = set()
-            check_dfs[num_p] = {}
-            print(f'Processing {len(features)} features on {self.ds_aux.n_jobs} CPU{"s" if self.ds_aux.n_jobs > 1 else ""}...')
-            if self.ds_aux.n_jobs > 1 and len(features) > self.ds_aux.n_jobs:
-                with futures.ProcessPoolExecutor(max_workers=self.ds_aux.n_jobs) as pool:
-                    for i, result in enumerate(tqdm(pool.map(partial(self.auto_fit_feature, auto_fit_parameters=auto_fit_parameters,
-                                                                     verbose=verbose if self.ds_aux.n_jobs == 1 else False),
-                                                             [self.feature_woes[feature] for feature in features]), total=len(features))):
-                        self.feature_woes[features[i]].is_active, check_dfs[num_p][features[i]] = result
-                    gc.collect()
-            else:
-                for feature in tqdm(features):
-                    self.feature_woes[feature].is_active, check_dfs[num_p][feature] = \
-                        self.feature_woes[feature].auto_fit(verbose=verbose, **auto_fit_parameters)
+        if woe_best_samples:
+            woe_best_samples = [f for f in woe_best_samples if f in self.ds_aux.samples or 'Bootstrap' if f]
+        if not woe_best_samples:
+            woe_best_samples = [self.ds_aux.train_name]
+        scorecard = pd.DataFrame()
 
-            with pd.ExcelWriter(f'{folder}checks{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx', engine="openpyxl") as writer, \
-                 pd.ExcelWriter(f'{folder}checks{f"_{num_p}" if len(params_list) > 1 else ""}_all.xlsx', engine="openpyxl") as writer_all:
-                for i in range(5):
-                    res_df = pd.concat([check_dfs[num_p][f][i] for f in check_dfs[num_p]]).reset_index(drop=True)
-                    save_res_file(res_df, i, writer_all)
-                    if not res_df.empty:
-                        res_df = res_df[res_df.groupby(['feature'])['iteration'].transform('max') == res_df['iteration']]
-                        save_res_file(res_df, i, writer)
-                        if i == 1:
-                            Vlogic_features[num_p] = set(res_df[res_df['trend_type'] == 'V-shape']['feature'].values)
-                        if i == 2:
-                            res_df = res_df[res_df['feature'].isin([f for f in features if self.feature_woes[f].is_active])].drop(['iteration'], axis=1).set_index('feature')
-                            res_df = res_df.round(self.round_woe)
-                            if num_p == 1:
-                                df_feature_gini = res_df.copy()
-                                df_feature_gini_columns = df_feature_gini.columns
-                            else:
-                                df_feature_gini = df_feature_gini.merge(res_df, left_index=True, right_index=True, how='outer')
-                            if woe_best_samples:
-                                woe_best_samples = [f for f in woe_best_samples if f in res_df.columns]
-                            if not woe_best_samples:
-                                woe_best_samples = [self.ds_aux.train_name]
-                            res_df['gini'] = res_df[woe_best_samples].mean(axis=1)
-                            for f, g in res_df['gini'].to_dict().items():
-                                try:
-                                    f_gini[f][num_p] = g
-                                except:
-                                    f_gini[f] = {num_p: g}
-                df_params = pd.DataFrame().from_dict(auto_fit_parameters, orient='index', columns=['value'])
-                save_res_file(df_params, 6, writer)
-                save_res_file(df_params, 6, writer_all)
-            woe_dfs = [check_dfs[num_p][f][5] for f in check_dfs[num_p] if self.feature_woes[f].is_active]
-            if woe_dfs:
-                woe_df = pd.concat(woe_dfs)
-                woe_df.to_excel(f'{folder}scorecard{f"_{num_p}" if len(params_list) > 1 else ""}_all.xlsx', index=False)
-                woe_df = woe_df[woe_df.groupby(['feature'])['iteration'].transform('max') == woe_df['iteration']]
-                woe_df.to_excel(f'{folder}scorecard{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx', index=False)
-                if len(params_list) == 1:
-                    woe_df[f'Gini {woe_best_samples[0] if len(woe_best_samples) == 1 else f"avg {woe_best_samples}"}'] = woe_df['feature'].map({f: f_gini[f][1] for f in f_gini}).round(self.round_woe)
-                    woe_df.to_excel(file_scorecard, index=False)
-                    self.import_scorecard(woe_df, verbose=False, fit_flag=False)
+        # ------------------------------------------ autobinning for features ------------------------------------------
+        if features:
+            print(f'Performing autobinning with parameters space of size {len(params_list)}...')
+            f_gini = {}
+            Vlogic_features = {}
+            # check_dfs = {num_i: {feature: [feature_log, feature_bl, feature_gini, feature_woe, feature_er, woe_out]}}
+            check_dfs = {num_p: {} for num_p in range(1, len(params_list) + 1)}
+            for num_p, param in enumerate(params_list, start=1):
+                auto_fit_parameters.update({params_names[k]: param[k] for k in range(len(param))})
+                print(f'Using parameters set {num_p}/{len(params_list)}: {auto_fit_parameters}')
+                for p in ['SM_target_threshold', 'SM_size_threshold']:
+                    if auto_fit_parameters[p] and auto_fit_parameters[p] < 1:
+                        auto_fit_parameters[p] = int(round(len(self.ds_aux.samples[self.ds_aux.train_name]) * auto_fit_parameters[p], 0))
+                print(f'Processing {len(features)} features on {self.ds_aux.n_jobs} CPU{"s" if self.ds_aux.n_jobs > 1 else ""}...')
+                if self.ds_aux.n_jobs > 1 and len(features) > self.ds_aux.n_jobs:
+                    with futures.ProcessPoolExecutor(max_workers=self.ds_aux.n_jobs) as pool:
+                        for i, result in enumerate(tqdm(pool.map(partial(self.auto_fit_feature, auto_fit_parameters=auto_fit_parameters,
+                                                                         verbose=verbose if self.ds_aux.n_jobs == 1 else False),
+                                                                 [self.feature_woes[feature] for feature in features]), total=len(features))):
+                            self.feature_woes[features[i]].is_active, check_dfs[num_p][features[i]] = result
+                        gc.collect()
+                else:
+                    for feature in tqdm(features):
+                        self.feature_woes[feature].is_active, check_dfs[num_p][feature] = \
+                            self.feature_woes[feature].auto_fit(verbose=verbose, **auto_fit_parameters)
+    
+                f_gini[num_p], Vlogic_features[num_p] = save_check_dfs(dfs=check_dfs[num_p], woe_best_samples=woe_best_samples,
+                                                                       check_file=f'{folder}checks{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx')
+                woe_dfs = [check_dfs[num_p][f][5] for f in check_dfs[num_p] if self.feature_woes[f].is_active]
+                if woe_dfs:
+                    scorecard = pd.concat(woe_dfs)
+                    scorecard.to_excel(f'{folder}scorecard{f"_{num_p}" if len(params_list) > 1 else ""}_all.xlsx', index=False)
+                    scorecard = scorecard[scorecard.groupby(['feature'])['iteration'].transform('max') == scorecard['iteration']]
+                    scorecard.to_excel(f'{folder}scorecard{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx', index=False)
+                    #scorecard[f'Gini {woe_best_samples[0] if len(woe_best_samples) == 1 else f"avg {woe_best_samples}"}'] = scorecard['feature'].map(f_gini[1]).round(self.round_woe)
+                else:
+                    print(f'There are no successfully binned features with parameters set {num_p}!')
+    
+            if len(params_list) > 1:
+                WOE_best_dfs = []
+                for f in features:
+                    ginis = {num_p: f_gini[num_p][f] if f not in Vlogic_features[num_p] else f_gini[num_p][f] - BL_allow_Vlogic_to_increase_gini
+                             for num_p in f_gini if f in f_gini[num_p]}
+                    num_p = max(ginis, key=ginis.get)
+                    tmp = check_dfs[num_p][f][5]
+                    tmp['params_set'] = num_p
+                    tmp[f'Gini {woe_best_samples[0] if len(woe_best_samples) == 1 else f"avg {woe_best_samples}"}'] = round(f_gini[num_p][f], self.round_woe)
+                    WOE_best_dfs.append(tmp[tmp.groupby(['feature'])['iteration'].transform('max') == tmp['iteration']])
+                if WOE_best_dfs:
+                    scorecard = pd.concat(WOE_best_dfs)
+                else:
+                    print(f'There are no successfully binned features with any parameters set!')
+            if not scorecard.empty:
+                scorecard.to_excel(file_scorecard, index=False)
+                self.import_scorecard(scorecard, verbose=False, fit_flag=False)
+            excluded = [f for f in features if not self.feature_woes[f].is_active]
+            if excluded:
+                print(f'Excluded features {excluded} because no suitable binning was found for them')
+        # --------------------------------------- autobinning for cross features ---------------------------------------
+        if cross_features or cross_num_second_level != 0:
+            print(f'Performing autobinning for cross features with parameters space of size {len(params_list)}...')
+            check_dfs = {}
+            f_gini = {}
+            features_active = set([f for f in self.feature_woes if self.feature_woes[f].is_active])
+            if scorecard.empty:
+                scorecard = self.export_scorecard()
+            new_sc = pd.DataFrame()
+            if cross_features:
+                crosses = {}
+                for f in cross_features:
+                    f1, f2 = cross_split(f)
+                    if f1 in features_active:
+                        try:
+                            crosses[f1].append(f2)
+                        except:
+                            crosses[f1] = [f2]
+                    else:
+                        print(f'No active binning for feature {f1} found. Cross feature {f} skipped.')
             else:
-                print(f'There are no successfully binned features with parameters set {num_p}!')
-        if len(params_list) > 1:
-            if not df_feature_gini.empty:
-                df_feature_gini.columns = pd.MultiIndex.from_product([[num_i + 1 for num_i in range(len(params_list))],
-                                                                      df_feature_gini_columns])
-                df_feature_gini.to_excel(folder + 'features_gini.xlsx')
-            WOE_best_dfs = []
-            for f in f_gini:
-                ginis = {num_p: f_gini[f][num_p] if f not in Vlogic_features[num_p] else f_gini[f][num_p] - BL_allow_Vlogic_to_increase_gini
-                         for num_p in f_gini[f]}
-                num_p = max(ginis, key=ginis.get)
-                tmp = check_dfs[num_p][f][5]
-                tmp['params_set'] = num_p
-                tmp[f'Gini {woe_best_samples[0] if len(woe_best_samples) == 1 else f"avg {woe_best_samples}"}'] = round(f_gini[f][num_p], self.round_woe)
-                WOE_best_dfs.append(tmp[tmp.groupby(['feature'])['iteration'].transform('max') == tmp['iteration']])
-            if WOE_best_dfs:
-                WOE_best = pd.concat(WOE_best_dfs)
-                WOE_best.to_excel(file_scorecard, index=False)
-                self.import_scorecard(WOE_best, verbose=False, fit_flag=False)
-            else:
-                print(f'There are no successfully binned features with any parameters set!')
-        excluded = [f for f in features if not self.feature_woes[f].is_active]
-        if excluded:
-            print(f'Excluded features {excluded} because no suitable binning was found for them')
+                if cross_features_first_level is None:
+                    cross_features_first_level = features if features else features_active
+                cross_features_first_level = set(cross_features_first_level) & features_active
+                if cross_num_second_level == -1 or cross_num_second_level >= len(features_active) - 1:
+                    cross_num_second_level = len(features_active) - 1
+                    crosses = {f1: [f2 for f2 in features_active if f2 != f1] for f1 in cross_features_first_level}
+                else:
+                    crosses = {}
+                    print('Finding the best pairs to first-level features...')
+                    for f1 in tqdm(cross_features_first_level):
+                        df1_group = self.feature_woes[f1].ds.samples[self.feature_woes[f1].ds.train_name][['group']]
+                        impurity = {}
+                        if self.ds_aux.n_jobs > 1 and len(features) > self.ds_aux.n_jobs:
+                            f2_features = [f2 for f2 in features_active if f2 != f1]
+                            with futures.ProcessPoolExecutor(max_workers=self.ds_aux.n_jobs) as pool:
+                                for i, result in enumerate(pool.map(partial(self.get_f2_impurity, df1_group=df1_group),
+                                                 [self.feature_woes[f2] for f2 in f2_features])):
+                                    impurity[f2_features[i]] = result
+                                gc.collect()
+                        else:
+                            impurity = {f2: self.get_f2_impurity(self.feature_woes[f2], df1_group) for f2 in features_active if f2 != f1}
+                        crosses[f1] = sorted(impurity, key=impurity.get, reverse=True)[:cross_num_second_level]
+                cross_features = [cross_name(f1, f2) for f1 in crosses for f2 in crosses[f1]]
+            auto_fit_parameters['BL_allow_Vlogic_to_increase_gini'] = 100
+            auto_fit_parameters['max_n_bins'] = max(auto_fit_parameters['max_n_bins'], 5)
+            check_dfs = {num_p: {} for num_p in range(1, len(params_list) + 1)}
+            checks_result = {num_p: {} for num_p in range(1, len(params_list) + 1)}
+            print('Creating feature_crosses...')
+            for f1 in tqdm(crosses):
+                self.feature_crosses[f1] = FeatureCross(self.feature_woes[f1])
+                self.feature_crosses[f1].add_f2_features([self.feature_woes[f2] for f2 in crosses[f1]])
+
+            for num_p, param in enumerate(params_list, start=1):
+                auto_fit_parameters.update({params_names[k]: param[k] for k in range(len(param))})
+                print(f'Using parameters set {num_p}/{len(params_list)}: {auto_fit_parameters}')
+                for p in ['SM_target_threshold', 'SM_size_threshold']:
+                    if auto_fit_parameters[p] and auto_fit_parameters[p] < 1:
+                        auto_fit_parameters[p] = int(round(len(self.ds_aux.samples[self.ds_aux.train_name]) * auto_fit_parameters[p], 0))
+                print(f'Processing {len(crosses)} first level features on {self.ds_aux.n_jobs} CPU{"s" if self.ds_aux.n_jobs > 1 else ""}...')
+
+                if self.ds_aux.n_jobs > 1 and len(features) > self.ds_aux.n_jobs:
+                    with futures.ProcessPoolExecutor(max_workers=self.ds_aux.n_jobs) as pool:
+                        crosses_list = list(crosses)
+                        for i, result in enumerate(tqdm(pool.map(partial(self.auto_fit_feature, auto_fit_parameters=auto_fit_parameters,
+                                                                         verbose=verbose if self.ds_aux.n_jobs == 1 else False),
+                                                                 [self.feature_crosses[f1] for f1 in crosses_list]), total=len(crosses_list))):
+                            checks_result[num_p][crosses_list[i]], check_dfs[num_p][crosses_list[i]] = result
+                        gc.collect()
+                else:
+                    for f1 in tqdm(crosses):
+                        checks_result[num_p][f1], check_dfs[num_p][f1] = self.feature_crosses[f1].auto_fit(verbose=verbose, **auto_fit_parameters)
+
+                for f1 in crosses:
+                    if check_dfs[num_p][f1]:
+                        for i in range(5):
+                            check_dfs[num_p][f1][i].insert(loc=0, column='feature1', value=f1)
+                f_gini[num_p], _ = save_check_dfs(dfs=check_dfs[num_p], woe_best_samples=woe_best_samples, check_file=f'{folder}checks_crosses{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx')
+                woe_dfs = [check_dfs[num_p][f][5] for f in check_dfs[num_p] if check_dfs[num_p][f]]
+                if woe_dfs:
+                    new_sc = pd.concat(woe_dfs)
+                    new_sc = new_sc[~new_sc['feature'].isin([cross_name(f1, f2) for f1 in checks_result[num_p] for f2 in checks_result[num_p][f1] if not checks_result[num_p][f1][f2]])]
+                    new_sc.to_excel(f'{folder}scorecard_crosses{f"_{num_p}" if len(params_list) > 1 else ""}.xlsx', index=False)
+                else:
+                    print(f'There are no successfully binned cross features with parameters set {num_p}!')
+            if len(params_list) > 1:
+                woe_dfs = []
+                others_dfs = {}
+                for k in {k for i in f_gini for k in f_gini[i]}:
+                    g = {i: f_gini[i][k] for i in f_gini if k in f_gini[i] and checks_result[i][k[0]][k[2]]}
+                    if not g:
+                        continue
+                    num_p = max(g, key=g.get)
+                    tmp = check_dfs[num_p][k[0]][5]
+                    tmp['params_set'] = num_p
+                    others_dfs[k[0]] = tmp[tmp['group'] == 'others'].copy()
+                    tmp = tmp[(tmp['values'].str.split(' & ').str[0] == k[1]) & (tmp['feature'].str[6:].str.split('&').str[1] == k[2])]
+                    woe_dfs.append(tmp)
+                woe_dfs += list(others_dfs.values())
+                if woe_dfs:
+                    new_sc = pd.concat(woe_dfs).sort_values(by=['feature', 'group'])
+                else:
+                    print(f'There are no successfully binned cross features with any parameters set!')
+            self.feature_crosses.clear()
+            if not new_sc.empty:
+                scorecard = pd.concat([scorecard, new_sc])
+                scorecard.to_excel(file_scorecard, index=False)
+                self.import_scorecard(scorecard, verbose=False, fit_flag=False)
         print(f'Scorecard saved to the file {file_scorecard}')
         if plot_flag != -1:
             print('Plotting binnings...')
-            self.plot_bins(folder=folder + 'Figs_binning', features=features, plot_flag=plot_flag, verbose=True)
-        print(f'All done! {len(features) - len(excluded)}/{len(features)} features successfully binned.')
+            self.plot_bins(folder=folder + 'Figs_binning', features=features+cross_features, plot_flag=plot_flag, verbose=True)
+        print(f'All done!{f" {len(features) - len(excluded)}/{len(features)} features successfully binned." if features else ""}'
+              f'{f" Found {len([f for f in self.cross_features if f in cross_features])} cross features." if cross_features else ""}')
 
     @staticmethod
     def plot_bins_feature(feature_woe, ds_aux, folder=None, plot_flag=True, show_groups=False, all_samples=False):
@@ -490,7 +641,7 @@ class WOE:
         :param plot_flag: флаг для вывода рисунка
         :param show_groups: флаг для отображения номер групп на рисунке
         """
-        f_WOE = feature_woe.feature + '_WOE'
+        f_WOE = add_suffix(feature_woe.feature)
         ds = feature_woe.transform()
         if ds.samples is None:
             return None
@@ -525,13 +676,13 @@ class WOE:
                 tick.set_rotation(30)
             ax_2.tick_params(axis='both', which='both', length=5, labelbottom=True)
             ax_2.annotate(f'Min: {round(x_stat[0], feature_woe.round_digits)}', xy=(0, 1), xycoords=('axes fraction', 'axes fraction'),
-                          xytext=(0, 70), textcoords='offset pixels', color='black', size=12, ha='left')
+                          xytext=(0, 59), textcoords='offset pixels', color='black', ha='left')
             ax_2.annotate(f'Median: {round(x_stat[1], feature_woe.round_digits)}', xy=(0, 1),
                           xycoords=('axes fraction', 'axes fraction'),
-                          xytext=(0, 50), textcoords='offset pixels', color='black', size=12, ha='left')
+                          xytext=(0, 37), textcoords='offset pixels', color='black', ha='left')
             ax_2.annotate(f'Max: {round(x_stat[2], feature_woe.round_digits)}', xy=(0, 1),
                           xycoords=('axes fraction', 'axes fraction'),
-                          xytext=(0, 30), textcoords='offset pixels', color='black', size=12, ha='left')
+                          xytext=(0, 15), textcoords='offset pixels', color='black', ha='left')
         else:
             if ds_aux.time_column is None:
                 fig, ax_1 = plt.subplots(1, 1, figsize=(13.5, 6))
@@ -554,16 +705,16 @@ class WOE:
             ax_3.xaxis.get_label().set_visible(False)
             ax_3.legend(loc='center left', bbox_to_anchor=(1, 0.5))
         if ds_aux.id_column is not None:
-            to_calc = feature_woe.ds.samples[ds.train_name]
+            to_calc = feature_woe.ds.samples[ds.train_name].copy()
             to_calc[ds_aux.id_column] = ds_aux.samples[ds_aux.train_name][ds_aux.id_column]
             to_calc[f'{ds_aux.id_column}_1'] = to_calc.apply(lambda row: row[ds_aux.id_column] if row[ds.target] == 1 else np.nan, axis=1)
             stats = to_calc.groupby('group').agg({ds.target: ['sum', 'size'],
                                                   ds_aux.id_column: 'nunique',
-                                                  f'{ds_aux.id_column}_1': 'nunique'}).set_axis(['target_0', 'Observations_0', 'Unique ids', 'Unique target events'], axis=1)
+                                                  f'{ds_aux.id_column}_1': 'nunique'}).set_axis(['target_0', 'Observations_0', 'Unique ids', 'Class 1 unique ids'], axis=1)
         else:
             stats = feature_woe.ds.samples[ds.train_name].groupby('group').agg({ds.target: ['sum', 'size']}).set_axis(['target_0', 'Observations_0'], axis=1)
             stats['Unique ids'] = stats['Observations_0']
-            stats['Unique target events'] = stats['target_0']
+            stats['Class 1 unique ids'] = stats['target_0']
         stats = stats.reset_index()
         samples_to_show = [ds.train_name]
         if all_samples:
@@ -572,10 +723,12 @@ class WOE:
                 tmp = feature_woe.ds.samples[sample].copy()
                 tmp['group'] = feature_woe.set_groups(data=tmp[feature_woe.feature])
                 stats = stats.merge(tmp.groupby('group').agg({ds.target: ['sum', 'size']}).set_axis([f'target_{i}', f'Observations_{i}'], axis=1).reset_index(), on='group', how='outer')
-                if all_samples > 1:
-                    stats = stats.merge(feature_woe.calc_groups_stat(df=tmp)[['woe']].set_axis([f'woe_{i}'], axis=1).reset_index(), on='group', how='outer')
+                if all_samples > 1 and i > 0:
+                    stats[f'woe_{i}'] = stats['group'].map(feature_woe.calc_simple_woes(df=tmp))
         stats['woe_0'] = stats['group'].map(feature_woe.woes)
+        stats['down_trend'] = ((stats['woe_0'] < stats['woe_0'].shift(1)) & (stats['group'].shift(1) >= 0)) if not feature_woe.categorical_type else False
         stats['label'] = stats['group'].map(feature_woe.groups).astype('str').apply(lambda x: '\n'.join(wrap(str(x), 25)))
+        stats['Target rate'] = (stats['target_0']*100 / stats['Observations_0']).round(2).astype('str') + '%'
         stats = stats.fillna(0)
         if feature_woe.categorical_type:
             stats = stats[pd.isnull(stats['woe_0']) == False].sort_values('woe_0').reset_index()
@@ -589,23 +742,22 @@ class WOE:
             stats.loc[stats['group'] == -2 - i, 'label'] = group
         ax_1.set_ylabel('Observations')
         ax_1.set_xticks(range(stats.shape[0]))
-        ax_1.set_xticklabels(stats['label'], rotation=30, ha='right', fontsize=10 if show_groups else 12)
+        ax_1.set_xticklabels(stats['label'], rotation=30, ha='right', fontsize=10 if show_groups else 11)
         ax2 = ax_1.twinx()
         ax2.set_ylabel('WOE', loc='bottom')
         ax2.grid(axis='y', zorder=1, alpha=0.6)
         for i, sample in enumerate(samples_to_show):
             w = 0.8/len(samples_to_show)
-            shift = (i - (len(samples_to_show) - 1)/2)*(w+0.03)
+            shift = (i - (len(samples_to_show) - 1)/2)*(w + 0.03)
             amt = stats[f'Observations_{i}'].sum()
             ax_1.bar(stats.index + shift, (stats[f'Observations_{i}'] - stats[f'target_{i}']) / amt, width=w, zorder=0, alpha=1 - i*0.25, color='forestgreen', label=f'Class 0{" (" + sample + ")" if len(samples_to_show) > 1 else ""}')
             ax_1.bar(stats.index + shift, stats[f'target_{i}'] / amt, bottom=(stats[f'Observations_{i}'] - stats[f'target_{i}']) / amt, width=w, zorder=0, alpha=1 - i*0.25, color='indianred', label=f'Class 1{" (" + sample + ")" if len(samples_to_show) > 1 else ""}')
             if all_samples > 1 or i == 0:
-                DR = stats[f'target_{i}'] / stats[f'Observations_{i}']
                 if all_samples <= 1:
                     shift = 0
                 for x, y in stats[f'woe_{i}'].items():
-                    ax2.annotate('{0:.2%}'.format(DR[x]), xy=(x + shift, y), xytext=(0, 20), textcoords='offset pixels',
-                                 color='black', ha='center', size=12 if (all_samples <= 1 or len(samples_to_show) < 3) else 10)
+                    ax2.annotate(str(y), xy=(x + shift, y), xytext=(30 if stats['down_trend'][x] else -30, 10), textcoords='offset pixels',
+                                 color='black', ha='center', size=11 if (all_samples <= 1 or len(samples_to_show) < 3) else 10)
                 if i == 0:
                     if feature_woe.categorical_type:
                         ax2.plot(stats.index + shift, stats['woe_0'], 'bo', linewidth=2.0, zorder=4, label='WOE')
@@ -615,24 +767,234 @@ class WOE:
                         ax2.plot(stats[stats['line'] == 0].index + shift, stats[stats['line'] == 0]['woe_0'], 'bo', linewidth=2.0, zorder=4)
                 else:
                     ax2.plot(stats.index + shift, stats[f'woe_{i}'], 'bo', linewidth=2.0, zorder=4, alpha=1 - i*0.25)
+            if i == 0 and feature_woe.ds.bootstrap_base is not None:
+                feature_woe.ds.bootstrap_base['group'] = feature_woe.set_groups(data=feature_woe.ds.bootstrap_base[feature_woe.feature])
+                bootstrap_woes_l = [feature_woe.calc_simple_woes(df=feature_woe.ds.bootstrap_base.iloc[idx]) for idx in feature_woe.ds.bootstrap]
+                bootstrap_woes = {g: np.array([w[g] for w in bootstrap_woes_l if g in w]) for g in feature_woe.groups}
+                stats['woe_mean'] = stats['group'].map({g: np.mean(v) for g, v in bootstrap_woes.items()})
+                stats['woe_std'] = stats['group'].map({g: np.std(v) for g, v in bootstrap_woes.items()})
+                ax2.errorbar(stats.index + shift, stats['woe_mean'], xerr=0, yerr=stats['woe_std'] * 1.96, color='b', capsize=5, fmt='none', alpha=0.4)
 
-        for stat, shift in {'Unique target events': 30, 'Unique ids': 50, 'Observations_0': 70}.items():
-            ax_1.annotate(stat.replace('_0', '') + ':', xy=(-0.5, 1), xycoords=('data', 'axes fraction'),
-                          xytext=(0, shift), textcoords='offset pixels', color='black', size=12, ha='right')
+        for stat, shift in {'Target rate': 15, 'Class 1 unique ids': 37, 'Unique ids': 59, 'Observations_0': 83}.items():
+            ax_1.annotate(stat.replace('_0', ''), xy=(-0.5, 1), xycoords=('data', 'axes fraction'),
+                          xytext=(0, shift), textcoords='offset pixels', color='black', ha='right')
             for i, val in enumerate(stats[stat].values):
                 ax_1.annotate(str(val), xy=(i, 1), xycoords=('data', 'axes fraction'),
-                              xytext=(0, shift), textcoords='offset pixels', color='black', size=12, ha='center')
-        ds.calc_gini()
-        ax_1.annotate('Gini: %s' % ('; '.join(['%s %.2f' % (name, ds.ginis[name][f_WOE]) for name in ds.ginis])),
-                      xy=(0.5, 1), xycoords=('figure fraction', 'axes fraction'), xytext=(0, 100), textcoords='offset pixels', color='blue', size=12, ha='center')
+                              xytext=(0, shift), textcoords='offset pixels', color='black', ha='center')
+        ax_1.annotate('Gini: %s' % ('; '.join(['%s %.2f' % (name, gini) for name, gini in ds.calc_gini(features=[f_WOE]).T[f_WOE].to_dict().items()])),
+                      xy=(0.5, 1), xycoords=('figure fraction', 'axes fraction'), xytext=(0, 115), textcoords='offset pixels', color='blue', ha='center')
         ax_1.grid(False)
         ax_1.tick_params(axis='y', which='both', length=5)
         h1, l1 = ax_1.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels()
-        ax_1.legend(h1 + h2, l1 + l2, bbox_to_anchor=(1.3 if len(samples_to_show) > 1 else 1.25, 1), fontsize=10 if len(samples_to_show) > 1 else 12)
+        ax_1.legend(h1 + h2, l1 + l2, bbox_to_anchor=(1.27 if len(samples_to_show) > 1 else 1.23, 1), fontsize=9 if len(samples_to_show) > 1 else 11)
         plt.suptitle(ds_aux.feature_titles[feature_woe.feature] if feature_woe.feature in ds_aux.feature_titles
-                     else feature_woe.feature, fontsize=16, weight='bold')
+                     else feature_woe.feature, fontsize=13, weight='bold')
         fig.tight_layout()
+        if folder is not None:
+            fig.savefig(f'{folder}/{f_WOE}.png', bbox_inches="tight")
+        if plot_flag:
+            plt.show()
+        return fig
+
+    @staticmethod
+    def plot_bins_feature_cross(params, ds_aux, folder=None, plot_flag=True, show_groups=False,
+                                all_samples=False):
+        """
+        Отрисовывает биннингодной переменной
+        :param feature_woe: объект класса FeatureWOE
+        :param ds_aux: вспомогательный ДатаСэмпл с полем среза
+        :param folder: папка, в которую должны быть сохранены рисунки. По умолчанию не сохраняются
+        :param plot_flag: флаг для вывода рисунка
+        :param show_groups: флаг для отображения номер групп на рисунке
+        """
+        feature_cross, f2 = params
+        feature_woe = feature_cross.feature_woe
+        feature_woe2 = list(feature_cross.cross[f2].values())[0]
+        f = cross_name(feature_woe.feature, f2)
+        f_WOE = add_suffix(f)
+        ds = feature_cross.transform(features=[f2])
+        size = 12 - len(feature_cross.get_woes(f2)) // 7
+        group_coord = {}
+        group_w = {}
+        group_d = {}
+        for i, (g, fw) in enumerate(feature_cross.cross[f2].items()):
+            for j, g2 in enumerate(fw.groups):
+                w = 0.8 / len(fw.groups)
+                shift = (j - (len(fw.groups) - 1) / 2) * (w + 0.03)
+                group_coord[str([g, g2])] = i + shift
+                group_w[str([g, g2])] = w
+                if len(fw.groups) == 1:
+                    group_d[g] = [i - w / 2, i + w / 2]
+                elif j == 0:
+                    group_d[g] = [i + shift - w / 2, ]
+                elif j == len(fw.groups) - 1:
+                    group_d[g].append(i + shift + w / 2)
+        if ds.samples is None:
+            return None
+
+        if ds_aux.time_column is None:
+            fig, (ax_1, ax_x) = plt.subplots(2, 1, gridspec_kw={'height_ratios': [6, 0.5]}, figsize=(13.5, 6.5))
+        else:
+            fig, (ax_1, ax_x, ax_3) = plt.subplots(3, 1, gridspec_kw={'height_ratios': [6, 0.5, 3]},
+                                                   figsize=(13.5, 9.5))
+        if ds_aux.time_column is not None:
+            gini_in_time = ds.calc_gini_in_time(ds_aux=ds_aux)
+            gini_in_time.columns = [x[1] for x in gini_in_time.columns]
+            gini_in_time[[c for c in gini_in_time.columns if c != 'Bootstrap std']].plot(ax=ax_3, marker='o')
+            if 'Bootstrap std' in gini_in_time.columns:
+                ax_3.fill_between(gini_in_time.index,
+                                  gini_in_time['Bootstrap mean'] - 1.96 * gini_in_time['Bootstrap std'],
+                                  gini_in_time['Bootstrap mean'] + 1.96 * gini_in_time['Bootstrap std'],
+                                  alpha=0.1, color='blue', label='95% conf interval')
+            ax_3.set_ylabel('Gini')
+            ax_3.set_title('Gini Stability', fontsize=14)
+            for tick in ax_3.get_xticklabels():
+                tick.set_rotation(30)
+            ax_3.tick_params(axis='both', which='both', length=5, labelbottom=True)
+            ax_3.xaxis.get_label().set_visible(False)
+            ax_3.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        to_calc = feature_woe.ds.samples[ds.train_name].merge(
+            pd.concat([fw.ds.samples[ds.train_name][f2] for g, fw in feature_cross.cross[f2].items()]), left_index=True,
+            right_index=True)
+        to_calc['group'] = feature_cross.set_groups(data=to_calc, f2=f2)
+        if ds_aux.id_column is not None:
+            to_calc[ds_aux.id_column] = ds_aux.samples[ds_aux.train_name][ds_aux.id_column]
+            to_calc[f'{ds_aux.id_column}_1'] = to_calc.apply(
+                lambda row: row[ds_aux.id_column] if row[ds.target] == 1 else np.nan, axis=1)
+            stats = to_calc.groupby('group').agg({ds.target: ['sum', 'size'],
+                                                  ds_aux.id_column: 'nunique',
+                                                  f'{ds_aux.id_column}_1': 'nunique'}).set_axis(
+                ['target_0', 'Observations_0', 'Unique ids', 'Class 1 unique ids'], axis=1)
+        else:
+            stats = to_calc.groupby('group').agg({ds.target: ['sum', 'size']}).set_axis(['target_0', 'Observations_0'],
+                                                                                        axis=1)
+            stats['Unique ids'] = stats['Observations_0']
+            stats['Class 1 unique ids'] = stats['target_0']
+        stats = stats.reset_index()
+        samples_to_show = [ds.train_name]
+        if all_samples:
+            samples_to_show += [s for s in feature_woe.ds.samples if s != ds.train_name]
+            for i, sample in enumerate(samples_to_show[1:], start=1):
+                tmp = feature_woe.ds.samples[sample].merge(
+                    pd.concat([fw.ds.samples[sample][f2] for g, fw in feature_cross.cross[f2].items()]),
+                    left_index=True, right_index=True)
+                tmp['group'] = feature_cross.set_groups(data=tmp, f2=f2)
+                stats = stats.merge(tmp.groupby('group').agg({ds.target: ['sum', 'size']}).set_axis(
+                    [f'target_{i}', f'Observations_{i}'], axis=1).reset_index(), on='group', how='outer')
+                if all_samples > 1 and i > 0:
+                    stats[f'woe_{i}'] = stats['group'].map(feature_woe.calc_simple_woes(df=tmp))
+        stats['woe_0'] = stats['group'].map(feature_cross.get_woes(f2))
+        stats['label'] = stats['group'].map(feature_cross.get_values(f2)).astype('str').apply(
+            lambda x: '\n'.join(wrap(str(x), 25)))
+        stats['Target rate'] = (stats['target_0'] * 100 / stats['Observations_0']).round(1).astype('str') + '%'
+        stats['coord'] = stats['group'].map(group_coord)
+        stats['w'] = stats['group'].map(group_w)
+        stats['group1'] = stats['group'].str[1:-1].str.split(', ').str[0].astype('int')
+        stats['group2'] = stats['group'].str[1:-1].str.split(', ').str[1].astype('int')
+        stats['down_trend'] = ((stats['woe_0'] < stats['woe_0'].shift(1)) & (
+                    stats['group1'] == stats['group1'].shift(1)) & (stats['group2'].shift(1) >=0)) if not feature_woe2.categorical_type else False
+        stats = stats.fillna(0)
+        for g in feature_woe.groups:
+            if feature_cross.cross[f2][g].missing_group != -1 and not feature_cross.cross[f2][g].categorical_type:
+                stats.loc[(stats['group1'] == g) & (
+                            stats['group2'] == feature_cross.cross[f2][g].missing_group), 'label'] += '\nwith missings'
+        if not feature_woe2.categorical_type:
+            stats['label'] = stats['label'].replace({']': ')', '\[-inf': '(-inf'}, regex=True)
+        if show_groups:
+            stats['label'] += '\n' + 'group ' + stats['group'].astype('str')
+        for i, group in enumerate(feature_woe.special_bins.keys()):
+            stats.loc[stats['group'] == -2 - i, 'label'] = group
+        ax_1.set_ylabel('Observations')
+        ax_1.set_xticks(stats['coord'])
+        ax_1.set_xticklabels(stats['label'], rotation=30, ha='right', fontsize=size - 1 if show_groups else size)
+
+        ax2 = ax_1.twinx()
+        ax2.set_ylabel('WOE', loc='bottom')
+        ax2.grid(axis='y', zorder=1, alpha=0.6)
+        for i, sample in enumerate(samples_to_show):
+            w = stats['w'] * 0.9 / len(samples_to_show)
+            shift = (i - (len(samples_to_show) - 1) / 2) * (w + 0.03)
+            amt = stats[f'Observations_{i}'].sum()
+            ax_1.bar(stats['coord'] + shift, (stats[f'Observations_{i}'] - stats[f'target_{i}']) / amt, width=w,
+                     zorder=0, alpha=1 - i * 0.25, color='forestgreen',
+                     label=f'Class 0{" (" + sample + ")" if len(samples_to_show) > 1 else ""}')
+            ax_1.bar(stats['coord'] + shift, stats[f'target_{i}'] / amt,
+                     bottom=(stats[f'Observations_{i}'] - stats[f'target_{i}']) / amt, width=w, zorder=0,
+                     alpha=1 - i * 0.25, color='indianred',
+                     label=f'Class 1{" (" + sample + ")" if len(samples_to_show) > 1 else ""}')
+            if all_samples > 1 or i == 0:
+                if all_samples <= 1:
+                    shift = 0
+                for x, y in stats[f'woe_{i}'].items():
+                    ax2.annotate(str(y), xy=(stats['coord'][x] + shift, y),
+                                 xytext=(30 if stats['down_trend'][x] else -30, 10), textcoords='offset pixels',
+                                 color='black', ha='center',
+                                 size=size if (all_samples <= 1 or len(samples_to_show) < 3) else size - 1)
+                if i == 0:
+                    if feature_woe2.categorical_type:
+                        ax2.plot(stats['coord'] + shift, stats['woe_0'], 'bo', linewidth=2.0, zorder=4, label='WOE')
+                    else:
+                        for j, (g, group) in enumerate(stats.groupby('group1')):
+                            group['line'] = group['group2'].apply(lambda x: not isinstance(x, str) and x >= 0).astype(
+                                'int')
+                            ax2.plot(group[group['line'] == 1]['coord'] + shift, group[group['line'] == 1]['woe_0'],
+                                     'bo-', linewidth=2.0, zorder=4, label='WOE' if j == 0 else None)
+                            ax2.plot(group[group['line'] == 0]['coord'] + shift, group[group['line'] == 0]['woe_0'],
+                                     'bo', linewidth=2.0, zorder=4)
+                else:
+                    ax2.plot(stats['coord'] + shift, stats[f'woe_{i}'], 'bo', linewidth=2.0, zorder=4,
+                             alpha=1 - i * 0.25)
+            if i == 0 and feature_woe.ds.bootstrap_base is not None:
+                tmp = feature_woe.ds.bootstrap_base.merge(feature_woe2.ds.bootstrap_base[f2], left_index=True,
+                                                          right_index=True)
+                tmp['group'] = feature_cross.set_groups(data=tmp, f2=f2)
+                bootstrap_woes_l = [feature_woe.calc_simple_woes(df=tmp.iloc[idx]) for idx in feature_woe.ds.bootstrap]
+                bootstrap_woes = {g: np.array([w[g] for w in bootstrap_woes_l if g in w]) for g in
+                                  tmp['group'].unique()}
+                stats['woe_mean'] = stats['group'].map({g: np.mean(v) for g, v in bootstrap_woes.items()})
+                stats['woe_std'] = stats['group'].map({g: np.std(v) for g, v in bootstrap_woes.items()})
+                ax2.errorbar(stats['coord'] + shift, stats['woe_mean'], xerr=0, yerr=stats['woe_std'] * 1.96, color='b',
+                             capsize=5, fmt=',', alpha=0.4)
+
+        for stat, shift in {'Target rate': 15, 'Class 1 unique ids': 37, 'Unique ids': 59,
+                            'Observations_0': 83}.items():
+            ax_1.annotate(stat.replace('_0', ''), xy=(-0.5, 1), xycoords=('data', 'axes fraction'),
+                          xytext=(0, shift), textcoords='offset pixels', color='black', ha='right', size=size)
+            for i, val in enumerate(stats[stat].values):
+                ax_1.annotate(str(val), xy=(stats['coord'][i], 1), xycoords=('data', 'axes fraction'),
+                              xytext=(0, shift), textcoords='offset pixels', color='black', ha='center', size=size)
+        ax_1.annotate('Gini: %s' % ('; '.join(
+            ['%s %.2f' % (name, gini) for name, gini in ds.calc_gini(features=[f_WOE]).T[f_WOE].to_dict().items()])),
+                      xy=(0.5, 1), xycoords=('figure fraction', 'axes fraction'), xytext=(0, 115),
+                      textcoords='offset pixels', color='blue', ha='center')
+        ax_1.grid(False)
+        ax_1.tick_params(axis='y', which='both', length=5)
+        h1, l1 = ax_1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax_1.legend(h1 + h2, l1 + l2, bbox_to_anchor=(1.27 if len(samples_to_show) > 1 else 1.15, 1),
+                    fontsize=9 if len(samples_to_show) > 1 else 11)
+        ds_aux.add_cross_description([f])
+        plt.suptitle(ds_aux.feature_titles[f] if f in ds_aux.feature_titles else f, fontsize=13, weight='bold')
+        fig.tight_layout()
+        ax_x.set_xlim(ax_1.get_xlim())
+        ax_x.set_yticks([])
+        ax_x.axis('off')
+        ax_1.annotate(f2, xy=(1, 0), xytext=(10, -30), textcoords='offset pixels', ha='left', va='top',
+                      xycoords='axes fraction')
+        ax_x.annotate(feature_woe.feature, xy=(1, 1), xytext=(10, 10), xycoords='axes fraction',
+                      textcoords='offset pixels', ha='left', va='top')
+        for g, d in group_d.items():
+            ax_x.annotate('', xy=(d[0], 1), xytext=(d[1], 1), xycoords=('data', 'axes fraction'),
+                          arrowprops={'arrowstyle': '|-|', 'facecolor': 'red'}, annotation_clip=False)
+            label = '\n'.join(wrap(str(feature_woe.groups[g]), 100 // len(feature_woe.groups)))
+            if not feature_woe.categorical_type:
+                label = label.replace(']', ')').replace('[-inf', '(-inf')
+            if feature_woe.missing_group != -1 and g == feature_woe.missing_group:
+                label += '\nwith missings'
+            ax_x.annotate(label, xy=((d[0] + d[1]) / 2, 1), xytext=(0, -10), xycoords=('data', 'axes fraction'),
+                          textcoords='offset pixels', ha='center', va='top',
+                          size=size if len(label) < 100 else size - 1 if len(label) < 200 else size - 2)
         if folder is not None:
             fig.savefig(f'{folder}/{f_WOE}.png', bbox_inches="tight")
         if plot_flag:
@@ -642,8 +1004,8 @@ class WOE:
     def plot_bins(self, features=None, folder=None, plot_flag=True, show_groups=False, verbose=False, all_samples=False):
         """
         Отрисовка биннинга
-        :param features: список переменных для обработки
-        :param folder: папка, в которую должны быть сохранены рисунки. По умолчанию не сохраняются
+        :param features: список переменных для обработки. При None отрисоываются все активные переменные
+        :param folder: папка, в которую должны быть сохранены рисунки. При None не сохраняются
         :param plot_flag: флаг для вывода рисунка
         :param show_groups: флаг для отображения номер групп на рисунке
         :param verbose: флаг для отображения счетчика обработанных рисунков
@@ -657,21 +1019,28 @@ class WOE:
         if folder and not os.path.exists(folder):
             os.makedirs(folder)
         if features is None:
-            features = list(self.feature_woes)
+            features = list(self.feature_woes) + list(self.cross_features)
         if plot_flag:
             verbose = False
-        features = [f for f in features if self.feature_woes[f].is_active]
+        cross_features = [f for f in features if f in self.cross_features]
+        features = [f for f in features if f in self.feature_woes and self.feature_woes[f].is_active]
         if self.ds_aux.n_jobs > 1 and len(features) > self.ds_aux.n_jobs:
             with futures.ProcessPoolExecutor(max_workers=self.ds_aux.n_jobs) as pool:
                 pool_iter = pool.map(partial(self.plot_bins_feature, ds_aux=self.ds_aux, folder=folder,
                                              plot_flag=plot_flag, show_groups=show_groups, all_samples=all_samples),
                                      [self.feature_woes[f] for f in features])
-                figs = list(tqdm(pool_iter, total=len(features)) if verbose else pool_iter)
+                pool_iter_cross = pool.map(partial(self.plot_bins_feature_cross, ds_aux=self.ds_aux, folder=folder,
+                                             plot_flag=plot_flag, show_groups=show_groups, all_samples=all_samples),
+                                     [(self.feature_crosses[cross_split(f)[0]], cross_split(f)[1]) for f in cross_features])
+                figs = list(tqdm(pool_iter, total=len(features)) if verbose else pool_iter) + list(tqdm(pool_iter_cross, total=len(cross_features)) if verbose else pool_iter_cross)
             gc.collect()
         else:
             figs = [self.plot_bins_feature(feature_woe=self.feature_woes[f], ds_aux=self.ds_aux, folder=folder,
                                            plot_flag=plot_flag, show_groups=show_groups, all_samples=all_samples)
-                    for f in (tqdm(features) if verbose else features)]
+                    for f in (tqdm(features) if verbose else features)] + \
+                   [self.plot_bins_feature_cross(params=(self.feature_crosses[cross_split(f)[0]], cross_split(f)[1]),
+                                                 ds_aux=self.ds_aux, folder=folder, plot_flag=plot_flag, show_groups=show_groups, all_samples=all_samples)
+                    for f in (tqdm(cross_features) if verbose else cross_features)]
         plt.close('all')
         return figs
 
@@ -683,22 +1052,33 @@ class WOE:
         :param plot_flag: флаг вывода графика после разделения
         """
 
-        print (feature, ': merging', groups_list)
-        if feature not in self.feature_woes:
-            print(f'{feature} does not exist! Skipping...')
-        else:
+        print(f'{feature}: merging groups {groups_list}')
+        if feature in self.feature_woes:
             self.feature_woes[feature].merge(groups_list)
-            if plot_flag:
-                self.plot_bins(features=[feature], folder=None, plot_flag=True, show_groups=True)
+        elif feature in self.cross_features:
+            f1, f2 = cross_split(feature)
+            if isinstance(groups_list[0], list) and isinstance(groups_list[1], list):
+                if groups_list[0][0] != groups_list[1][0]:
+                    print(f'For cross features first level groups must match! {groups_list[0][0]} != {groups_list[1][0]}')
+                    return None
+                self.feature_crosses[f1].cross[f2][groups_list[0][0]].merge([groups_list[0][1], groups_list[1][1]])
+            else:
+                print('For cross features groups_list must consist of two lists, for example [[0, 1], [0, 2]]')
+                return None
+        else:
+            print(f'{feature} does not exist! Skipping...')
+            return None
+        if plot_flag:
+            self.plot_bins(features=[feature], folder=None, plot_flag=True, show_groups=True)
 
-    def merge_by_woe(self, woe_threshold=0.05, with_missing=True):
+    def merge_by_woe(self, woe_threshold=0.05):
         """
         Объединение всех близких по ВОЕ бинов
         :param woe_threshold: минимальная разрешенная дельта WOE между соседними бинами
         :param with_missing: должна ли выполняться проверка для бина с пустыми значениями
         """
         for feature in self.feature_woes:
-            self.feature_woes[feature].merge_by_woe(woe_threshold=woe_threshold, with_missing=with_missing)
+            self.feature_woes[feature].merge_by_woe(woe_threshold=woe_threshold)
 
     def merge_by_size(self, target_threshold=5, size_threshold=100):
         """
@@ -721,24 +1101,22 @@ class WOE:
         :param scoring: метрика для оптимизации
         :param plot_flag: флаг вывода графика после разделения
         """
-        if feature not in self.feature_woes:
-            print(f'{feature} does not exist! Skipping...')
+
+        print(f'{feature}: splitting group {group}')
+        if feature in self.feature_woes:
+            self.feature_woes[feature].split(group=group, to_add=to_add, min_bin_size=min_bin_size, criterion=criterion, scoring=scoring)
+        elif feature in self.cross_features:
+            f1, f2 = cross_split(feature)
+            if isinstance(group, list):
+                self.feature_crosses[f1].cross[f2][group[0]].split(group=group[1], to_add=to_add, min_bin_size=min_bin_size, criterion=criterion, scoring=scoring)
+            else:
+                print('For cross features group must be a list!')
+                return None
         else:
-            if group is None:
-                if self.feature_woes[feature].categorical_type:
-                    for g in self.feature_woes[feature].groups:
-                        if to_add[0] in self.feature_woes[feature].groups[g]:
-                            group = g
-                            break
-                else:
-                    for g, v in self.feature_woes[feature].groups.items():
-                        if to_add >= v[0] and to_add < v[1]:
-                            group = g
-                            break
-            self.feature_woes[feature].split(group=group, to_add=to_add, min_bin_size=min_bin_size,
-                                             criterion=criterion, scoring=scoring)
-            if plot_flag:
-                self.plot_bins(features=[feature], folder=None, plot_flag=True, show_groups=True)
+            print(f'{feature} does not exist! Skipping...')
+            return None
+        if plot_flag:
+            self.plot_bins(features=[feature], folder=None, plot_flag=True, show_groups=True)
 
     def show_history(self, feature):
         """
@@ -778,27 +1156,37 @@ class WOE:
 
         :return: трансформированный ДатаСэмпл
         """
+        cross_features = self.cross_features
         if features is None:
-            features = ds.features
-        features = [rem_suffix(f) for f in features if rem_suffix(f) in self.feature_woes and self.feature_woes[rem_suffix(f)].is_active]
-        if ds.samples is None or all([add_suffix(f) in ds.samples[ds.train_name].columns for f in features]):
-            ds.features = [add_suffix(f) for f in features]
+            features = {rem_suffix(f) for f in ds.features} | cross_features
+        else:
+            features = {rem_suffix(f) for f in features}
+        new_features = {add_suffix(f) for f in features}
+        if ds.samples is None or all([new_features.issubset(ds.samples[name].columns) for name in ds.samples]):
+            ds.features = list(new_features)
             return ds
-        if verbose:
+        if verbose > 0:
             print('Transforming features...')
         ds = copy.deepcopy(ds)
-        for feature in features:
-            feature_woe = self.feature_woes[feature]
-            for name in ds.samples:
-                ds.samples[name][feature + '_WOE'] = feature_woe.set_avg_woes(data=ds.samples[name][feature],
-                                                                              groups=feature_woe.groups,
-                                                                              woes=feature_woe.woes)
-            if ds.bootstrap_base is not None:
-                ds.bootstrap_base[feature + '_WOE'] = feature_woe.set_avg_woes(data=ds.bootstrap_base[feature],
-                                                                               groups=feature_woe.groups,
-                                                                               woes=feature_woe.woes)
-        ds.features = [add_suffix(f) for f in features]
-        ds.gini_df = None
+        for f in features:
+            f_WOE = add_suffix(f)
+            if f in self.feature_woes and self.feature_woes[f].is_active:
+                for name in ds.samples:
+                    ds.samples[name][f_WOE] = self.feature_woes[f].set_avg_woes(data=ds.samples[name][f])
+                if ds.bootstrap_base is not None:
+                    ds.bootstrap_base[f_WOE] = self.feature_woes[f].set_avg_woes(data=ds.bootstrap_base[f])
+            elif f in cross_features:
+                f1, f2 = cross_split(f)
+                for name in ds.samples:
+                    ds.samples[name][f_WOE] = self.feature_crosses[f1].set_avg_woes(data=ds.samples[name][[f1, f2]], f2=f2)
+                if ds.bootstrap_base is not None:
+                    ds.bootstrap_base[f_WOE] = self.feature_crosses[f1].set_avg_woes(data=ds.bootstrap_base[[f1, f2]], f2=f2)
+            else:
+                if verbose > 0:
+                    print(f"Can't transform feature {f}. Skipped.")
+                new_features.remove(f_WOE)
+                continue
+        ds.features = list(new_features)
         return ds
 
     def export_scorecard(self, out=None, features=None, full=True, history=False):
@@ -810,32 +1198,37 @@ class WOE:
         :param history: если True, то сохраняется вся история биннингов. Дубли биннингов удаляются, текущий биннинг записывается последней итерацией
         :return: датафрейм со скоркартой
         """
+        cross_features = self.cross_features
         if features is None:
-            features = list(self.feature_woes)
+            features = [f for f in self.feature_woes if self.feature_woes[f].is_active] + list(cross_features)
         dfs = []
-        for feature in features:
-            if feature not in self.feature_woes or not self.feature_woes[feature].is_active:
-                continue
-            if history:
-                curr_iteration = self.feature_woes[feature].curr_iteration()
-                processed = []
-                i2 = 0
-                for i, h in enumerate(self.feature_woes[feature].history):
-                    if h not in processed and h != self.feature_woes[feature].history[curr_iteration]:
-                        self.feature_woes[feature].rollback(iteration=i)
-                        dfs.append(self.feature_woes[feature].export_scorecard(full=full, iteration=i2))
-                        processed.append(h)
-                        i2 += 1
-                self.feature_woes[feature].rollback(iteration=curr_iteration)
-                dfs.append(self.feature_woes[feature].export_scorecard(full=full, iteration=i2))
+        for f in features:
+            if f in self.feature_woes and self.feature_woes[f].is_active:
+                if history:
+                    curr_iteration = self.feature_woes[f].curr_iteration()
+                    processed = []
+                    i2 = 0
+                    for i, h in enumerate(self.feature_woes[f].history):
+                        if h not in processed and h != self.feature_woes[f].history[curr_iteration]:
+                            self.feature_woes[f].rollback(iteration=i)
+                            dfs.append(self.feature_woes[f].export_scorecard(full=full, iteration=i2))
+                            processed.append(h)
+                            i2 += 1
+                    self.feature_woes[f].rollback(iteration=curr_iteration)
+                    dfs.append(self.feature_woes[f].export_scorecard(full=full, iteration=i2))
+                else:
+                    dfs.append(self.feature_woes[f].export_scorecard(full=full))
+            elif f in cross_features:
+                f1, f2 = cross_split(f)
+                dfs.append(self.feature_crosses[f1].export_scorecard(features=[f2], full=full))
             else:
-                dfs.append(self.feature_woes[feature].export_scorecard(full=full))
+                print(f'No active binning for feature {f} found. Skipped.')
         if dfs:
             df = pd.concat(dfs).reset_index(drop=True)
         else:
             df = pd.DataFrame()
         if out is not None:
-            df.to_excel(out)
+            df.to_excel(out, index=False)
         return df
 
     def import_scorecard(self, scorecard, features=None, verbose=True, fit_flag=False):
@@ -854,14 +1247,52 @@ class WOE:
                 print('Unknown format of import file. Abort.')
                 return None
         if features is None:
-            features = list(scorecard.feature.unique())
+            features = list(scorecard['feature'].unique())
         for feature in features:
-            if verbose:
-                print(f'Replacing binning for {feature}..')
-            if feature in self.feature_woes:
-                self.feature_woes[feature].import_scorecard(scorecard[scorecard['feature'] == feature], verbose=verbose, fit_flag=fit_flag)
-            else:
-                print(f'Feature {feature} is missing in self.feature_woes! Skipped.')
+            if not is_cross(feature):
+                if feature in self.feature_woes:
+                    if verbose > 0:
+                        print(f'Replacing binning for {feature}..')
+                    self.feature_woes[feature].import_scorecard(scorecard[scorecard['feature'] == feature], verbose=verbose, fit_flag=fit_flag)
+                else:
+                    print(f'Feature {feature} is missing in self.feature_woes! Skipped.')
+        scorecard = scorecard[(scorecard['feature'].str.startswith('cross_')) & (scorecard['feature'].str.contains('&'))].copy()
+        if not scorecard.empty:
+            scorecard['f1'] = scorecard['feature'].str[6:].str.split('&').str[0]
+            scorecard['f2'] = scorecard['feature'].str[6:].str.split('&').str[1]
+            scorecard['categorical_type1'] = scorecard['categorical_type'].str[1:-1].str.split(', ').str[0].fillna('')
+            scorecard['categorical_type2'] = scorecard['categorical_type'].str[1:-1].str.split(', ').str[1].fillna('')
+            scorecard['group1'] = np.where(scorecard['group'] != 'others', scorecard['group'].str[1:-1].str.split(', ').str[0].fillna(0), 'others')
+            scorecard['group2'] = np.where(scorecard['group'] != 'others', scorecard['group'].str[1:-1].str.split(', ').str[1].fillna(0), 'others')
+            scorecard['values1'] = scorecard['values'].str.split(' & ').str[0]
+            scorecard['values2'] = scorecard['values'].str.split(' & ').str[1]
+            scorecard['missing1'] = np.where(scorecard['missing'].isin([0, 1, '0', '1']), 0,
+                                             scorecard['missing'].astype('str').str[1:-1].str.split(', ').str[0].fillna('0')
+                                             )
+            scorecard['missing2'] = np.where(scorecard['missing'].isin([0, 1, '0', '1']), scorecard['missing'],
+                                             scorecard['missing'].astype('str').str[1:-1].str.split(', ').str[1].fillna('0')
+                                             )
+            scorecard[['group1', 'group2', 'missing1', 'missing2']] = scorecard[['group1', 'group2', 'missing1', 'missing2']].applymap(lambda x: pd.to_numeric(x, errors='ignore'))
+            for f1, scorecard_f1 in scorecard.groupby('f1'):
+                if verbose > 0:
+                    print(f'Replacing binning for cross features {f1}..')
+                if f1 in self.feature_woes:
+                    fw = copy.deepcopy(self.feature_woes[f1])
+                else:
+                    fw = self.create_feature_woe(DataSamples(), f1)
+                fw.import_scorecard(scorecard=scorecard_f1[['f1', 'categorical_type1', 'group1', 'values1', 'woe', 'missing1']]\
+                                    .set_axis(['feature', 'categorical_type', 'group', 'values', 'woe', 'missing'], axis=1)\
+                                    .drop_duplicates(subset=['group']),
+                                    verbose=False, fit_flag=False)
+                self.feature_crosses[f1] = FeatureCross(fw)
+                self.feature_crosses[f1].add_f2_features([self.feature_woes[f2] if f2 in self.feature_woes else self.create_feature_woe(DataSamples(), f2)
+                                                             for f2 in scorecard_f1['f2'].unique()])
+                self.feature_crosses[f1].import_scorecard(scorecard_f1, verbose=verbose, fit_flag=fit_flag)
+
+    @property
+    def cross_features(self):
+        return {cross_name(f1, f2) for f1 in self.feature_crosses for f2 in self.feature_crosses[f1].cross}
+
 #----------------------------------------------------------------------------------------------------------
 
 
@@ -932,6 +1363,7 @@ class FeatureWOE:
         self.others_process = others_process
         self.opposite_sign_to_others = opposite_sign_to_others
         self.special_bins = special_bins
+        self.woe_threshold_missing = 0
         self.others_woe = np.nan
         self.is_active = False
         if feature in ds.cat_columns:
@@ -941,7 +1373,6 @@ class FeatureWOE:
             self.categorical_type = ''
             self.groups = {0: [-np.inf, np.inf]} # for categorical - {group_number: [list of values]}, for ordered -{group_number: [left_bound, right_bound]}
         # -1 - group number for missings
-        self.groups_stat = None
         self.woes = {0: 0} # group_number:woe
         self.missing_group = -1
         self.history = []
@@ -949,12 +1380,13 @@ class FeatureWOE:
             samples = {name: ds.samples[name][[ds.target, feature]] for name in ds.samples}
         else:
             samples = None        
-        self.ds = DataSamples(samples=samples, target=ds.target, features=[feature], cat_columns=[feature] if feature in ds.cat_columns else [], n_jobs=1)
+        self.ds = DataSamples(samples=samples, target=ds.target, features=[feature], cat_columns=[feature] if feature in ds.cat_columns else [],
+                              n_jobs=1, random_state=ds.random_state)
         if ds.bootstrap_base is not None:
             self.ds.bootstrap_base = ds.bootstrap_base[[ds.target, feature]]
             self.ds.bootstrap = ds.bootstrap
 
-    def calc_simple_woes(self):
+    def calc_simple_woes(self, df=None):
         '''
         Simply calculates regularized WOE for each interval.
         Formula for regularized WOE of the i-th interval (value group) of feature:
@@ -965,18 +1397,11 @@ class FeatureWOE:
         ----------
         woes: {group: woe}
         '''
-
-        if self.groups_stat is None:
-            self.calc_groups_stat()
-        groups_stat = self.groups_stat
-        if self.alpha is not None:
-            alpha = self.alpha
-        else:
-            alpha = 0
-        groups_stat['woe'] = (
-            np.log(groups_stat['n1'].sum() / groups_stat['n0'].sum() * (alpha + groups_stat['n']) /
-                   (groups_stat['n'] * (groups_stat['n1'] + self.woe_adjust) / (
-                           groups_stat['n0'] + self.woe_adjust) + alpha))).round(self.round_woe)
+        groups_stat = self.calc_groups_stat(df)
+        alpha = self.alpha if self.alpha is not None else 0
+        groups_stat['woe'] = (np.log(groups_stat['n1'].sum() / groups_stat['n0'].sum() * (alpha + groups_stat['n']) /
+                                       (groups_stat['n'] * (groups_stat['n1'] + self.woe_adjust) / (
+                                               groups_stat['n0'] + self.woe_adjust) + alpha))).round(self.round_woe)
         return groups_stat['woe'].to_dict()
 
     def woe_folds(self):
@@ -1000,10 +1425,8 @@ class FeatureWOE:
         woes: {left_bound : {fold_num : woe}} where left_bound is a lower bound of an interval, fold_num is a number of a fold (from 0 to n_folds-1), woe is a WOE value for the fold
         folds: {left_bound : {fold_num : fold_indexes}} where left_bound is a lower bound of an interval, fold_num is a number of a fold (from 0 to n_folds-1),  fold_indexes is indexes of samples in the fold
         '''
-
-        if self.groups_stat is None:
-            self.calc_groups_stat()
-        DR = self.groups_stat['n1'].sum() / self.groups_stat['n0'].sum()
+        groups_stat = self.calc_groups_stat()
+        DR = groups_stat['n1'].sum() / groups_stat['n0'].sum()
 
         folds = {}
         # calculation of folds
@@ -1055,16 +1478,12 @@ class FeatureWOE:
         if self.alpha is None:
             print ('Achtung bitte! Keine Alpha... Bis dann! :) ')
             return None
-
-        result = []
         woes, folds = self.woe_folds()
-
         # for each sample finds its interval (values group), fold and, consequently, WOE
-        for index, row in self.ds.samples[self.ds.train_name][[self.feature, self.ds.target]].iterrows():
-            for group in folds:
-                for fold in folds[group]:
-                    if index in folds[group][fold][1]:
-                        result.append(woes[group][fold])
+        result = [woes[group][fold] for index, row in self.ds.samples[self.ds.train_name][[self.feature, self.ds.target]].iterrows()
+                                    for group in folds
+                                    for fold in folds[group]
+                                    if index in folds[group][fold][1]]
         return woes, result
 
     def optimize_alpha(self):
@@ -1083,7 +1502,7 @@ class FeatureWOE:
         for alpha in self.alpha_range:
             self.alpha = alpha
             if self.simple:
-                x = self.set_avg_woes(woes=self.calc_simple_woes())
+                x = self.set_avg_woes(woes=self.calc_woes())
             else:
                 x = self.calc_woe_folds()[1]
             scores[alpha] = np.mean(cross_val_score(classifier, x, self.ds.samples[self.ds.train_name][self.ds.target],
@@ -1097,54 +1516,48 @@ class FeatureWOE:
             self.alpha = 0
         return self.alpha
 
-    def average_fold_woe(self, woe_folds):
-        '''
-        WOE calculation for an interval: average WOE through all the folds
+    def sorted_groups(self, groups=None):
+        if groups is None:
+            groups = self.groups.copy()
+        if self.categorical_type:
+            return groups
+        else:
+            return {**{k: v for k, v in groups.items() if isinstance(v, list) and len(v) == 1}, **groups}
 
-        Parameteres:
-        -------------
-        woe_folds: woes for folds
-
-        Returns
-        ------------
-        woes for interval bounds
-        '''
-        result = {}
-        for group in woe_folds:
-            result[group] = round(np.mean(np.array([woe_folds[group][fold] for fold in woe_folds[group]])), self.round_woe)
-        return result
-    
-    def get_transform_func(self, s='', data_s='data', groups=None, values=None, others=np.nan):
-        def where(data_s, group, vals, value, categorical_type, missing_group):
-            if group == -1:
-                return f"np.where({data_s}.isnull(), {value}, \n"
-            if categorical_type:
-                if missing_group != group:
-                    return f"np.where({data_s}.isin({vals}), {value}, \n"
+    def get_group_condition_code(self, group):
+        vals = self.groups[group]
+        data_s = f"df['{self.feature}']"
+        if group == -1:
+            return f"{data_s}.isnull()"
+        if self.categorical_type:
+            if self.missing_group != group:
+                return f"{data_s}.isin({vals})"
+            else:
+                return f"({data_s}.isin({vals})) | ({data_s}.isnull())"
+        if isinstance(vals, list):
+            if len(vals) == 2:
+                first = f'({data_s} >= {vals[0]})' if vals[0] != -np.inf else ''
+                second = f'({data_s} < {vals[1]})' if vals[1] != np.inf else ''
+                if not first and not second:
+                    first = f"~{data_s}.isnull()"
+                if self.missing_group != group:
+                    return f"{first}{' & ' if first and second else ''}{second}"
                 else:
-                    return f"np.where(({data_s}.isin({vals})) | ({data_s}.isnull()), {value}, \n"
-            if isinstance(vals, list):
-                if len(vals) == 2:
-                    first = f'({data_s} >= {vals[0]})' if vals[0] !=-np.inf else ''
-                    second = f'({data_s} < {vals[1]})' if vals[1] != np.inf else ''
-                    if missing_group != group:
-                        return f"np.where({first}{' & ' if first and second else ''}{second}, {value}, \n"
-                    else:
-                        return f"np.where(({first}{' & ' if first and second else ''}{second}) | ({data_s}.isnull()), {value}, \n"
-                else:
-                    return f"np.where({data_s} == {vals[0]}, {value}, \n"
+                    return f"({first}{' & ' if first and second else ''}{second}) | ({data_s}.isnull())"
+            else:
+                return f"{data_s} == {vals[0]}"
 
-        if not self.categorical_type:
-            groups = {**{k: v for k, v in groups.items() if isinstance(v, list) and len(v) == 1}, **groups}
-        groups_list = [g for g in groups if g in values]
-        len_s = len(s)       
+    def get_transform_func(self, start=''):
+        groups_list = [g for g in self.sorted_groups() if g in self.woes]
+        s = start
         for i, group in enumerate(groups_list):
-            s += where(data_s, group, groups[group], values[group], self.categorical_type, self.missing_group) + ' ' * len_s + ' ' * 9 * (i + 1)
-        s += f'{others}{")" * len(groups_list)}'.replace('nan', 'np.nan')
+            s += f"np.where({self.get_group_condition_code(group)}, {self.woes[group]}, \n" + " " * (len(start) + 9 * (i + 1))
+        s += f'{self.others_woe}{")" * len(groups_list)}'.replace('nan', 'np.nan')
         return s
 
     def get_condlist(self, data, groups):
         condlist = []
+        groups = self.sorted_groups(groups)
         for group in groups:
             vals = groups[group]
             if group == -1:
@@ -1165,7 +1578,7 @@ class FeatureWOE:
                         condlist.append(data == vals[0])
                 else:
                     condlist.append(data == vals)
-        return condlist
+        return condlist, groups
 
     def set_avg_woes(self, data=None, groups=None, woes=None):
         '''
@@ -1188,24 +1601,14 @@ class FeatureWOE:
             groups = self.groups
         if woes is None:
             woes = self.woes
-        if not self.categorical_type:
-            groups = {**{k: v for k, v in groups.items() if isinstance(v, list) and len(v) == 1}, **groups}
-        return np.select(self.get_condlist(data, groups), [woes[group] for group in groups], self.others_woe)
+        condlist, groups = self.get_condlist(data, groups)
+        return np.select(condlist, [woes[group] for group in groups], self.others_woe)
 
     def calc_groups_stat(self, df=None):
         groups_stat = (df if df is not None else self.ds.samples[self.ds.train_name]).groupby('group')\
                       .agg(n=(self.ds.target, 'count'), n1=(self.ds.target, 'sum'))
         groups_stat['n0'] = groups_stat['n'] - groups_stat['n1']
-        if self.alpha is not None:
-            alpha = self.alpha
-        else:
-            alpha = 0
-        groups_stat['woe'] = (
-            np.log(groups_stat['n1'].sum() / groups_stat['n0'].sum() * (alpha + groups_stat['n']) /
-                   (groups_stat['n'] * (groups_stat['n1'] + self.woe_adjust) / (
-                               groups_stat['n0'] + self.woe_adjust) + alpha))).round(self.round_woe)
-        if df is None:
-            self.groups_stat = groups_stat
+        groups_stat['woe'] = groups_stat.index.map(self.woes)
         return groups_stat
 
     def set_groups(self, data=None, groups=None, inplace=False):
@@ -1226,32 +1629,26 @@ class FeatureWOE:
             data = self.ds.samples[self.ds.train_name][self.feature]
         if groups is None:
             groups = self.groups
-
-        if not self.categorical_type:
-            groups = {**{k: v for k, v in groups.items() if isinstance(v, list) and len(v) == 1}, **groups}
-        result = np.select(self.get_condlist(data, groups), list(groups.keys()), 404)
+        condlist, groups = self.get_condlist(data, groups)
+        result = np.select(condlist, list(groups.keys()), 404)
         if inplace:
             self.ds.samples[self.ds.train_name]['group'] = result
-            self.calc_groups_stat()
         return result
 
     def print_woe(self):
         '''
         Prints WOE parameters in a standard and convenient way
         '''
-        if self.groups_stat is not None:
-            groups_stat = self.groups_stat.reset_index().copy()
-            groups_stat[['n', 'n1']] = groups_stat[['n', 'n1']].round(0).astype('int')
-            groups_stat['values'] = groups_stat['group'].map(self.groups).astype('str')
-            if self.missing_group != -1 and not self.categorical_type:
-                groups_stat.loc[groups_stat['group'] == self.missing_group, 'values'] += ' + missings'
-            for i, group in enumerate(self.special_bins.keys()):
-                groups_stat.loc[groups_stat['group'] == -2 - i, 'group'] = group
-            print('\nCurrent binning:')
-            print(groups_stat[['group', 'values', 'woe', 'n', 'n1']].to_string(index=False))
-            print()
-        else:
-            print('Empty self.groups_stat! Please use self.calc_groups_stat()')
+        groups_stat = self.calc_groups_stat().reset_index()
+        groups_stat[['n', 'n1']] = groups_stat[['n', 'n1']].round(0).astype('int')
+        groups_stat['values'] = groups_stat['group'].map(self.groups).astype('str')
+        if self.missing_group != -1 and not self.categorical_type:
+            groups_stat.loc[groups_stat['group'] == self.missing_group, 'values'] += ' + missings'
+        for i, group in enumerate(self.special_bins.keys()):
+            groups_stat.loc[groups_stat['group'] == -2 - i, 'group'] = group
+        print('\nCurrent binning:')
+        print(groups_stat[['group', 'values', 'woe', 'n', 'n1']].to_string(index=False))
+        print()
 
     def BusinessLogicChecker(self, BL_allow_Vlogic_to_increase_gini=100, verbose=False):
         '''
@@ -1266,7 +1663,7 @@ class FeatureWOE:
         ----------
         Boolean - whether the check was successful and dataframe of check log
         '''
-        if verbose:
+        if verbose > 0:
             print('\n------------- Business logic checks --------------')
         if not self.categorical_type:
             woes_dropna = {self.groups[x][0]: self.woes[x] for x in self.woes if
@@ -1275,35 +1672,33 @@ class FeatureWOE:
                                                                                                     axis=1)
             groups_info['upper'] = groups_info['lower'].shift(-1).fillna(np.inf)
             if groups_info.shape[0] == 1:
-                if verbose:
+                if verbose > 0:
                     print('Only one group with non-missing values is present. Skipping trend check...')
                 trend = ''
                 trend_type = 'one group'
             else:
                 gi_check = groups_info.dropna(how='all', subset=['lower', 'upper'])[['woe', 'lower', 'upper']].copy()
-                gi_check['risk_trend'] = np.sign((gi_check['woe'] - gi_check['woe'].shift(1)).dropna()).apply(
-                    lambda x: '+' if (x > 0) else '-' if (x < 0) else '0')
+                gi_check['risk_trend'] = np.sign((gi_check['woe'] - gi_check['woe'].shift(1)).dropna()).apply(lambda x: '+' if (x > 0) else '-' if (x < 0) else '0')
                 trend = gi_check['risk_trend'].str.cat()
                 if re.fullmatch('-*|\+*', trend):
                     trend_type = 'monotonic'
-                    if verbose:
+                    if verbose > 0:
                         print(f'WOE trend is monotonic')
                 elif BL_allow_Vlogic_to_increase_gini < 100 and re.fullmatch('-*\+*|\+*-*', trend):
-                    self.ds.calc_gini(features=[self.feature + '_WOE'])
-                    gini = self.ds.ginis[self.ds.train_name][self.feature + '_WOE']
+                    gini = self.ds.calc_gini(features=[add_suffix(self.feature)], samples=[self.ds.train_name]).at[add_suffix(self.feature), self.ds.train_name]
                     if gini < BL_allow_Vlogic_to_increase_gini:
                         trend_type = 'no trend'
-                        if verbose:
+                        if verbose > 0:
                             print(f'WOE trend is V-shaped, but gini is too low ({gini} < {BL_allow_Vlogic_to_increase_gini})')
                     else:
                         trend_type = 'V-shape'
-                        if verbose:
+                        if verbose > 0:
                             print(f'WOE trend is V-shaped')
                 else:
                     trend_type = 'no trend'
-                    if verbose:
+                    if verbose > 0:
                         print(f'WOE trend does not have right shape')
-            if verbose:
+            if verbose > 0:
                 fig = plt.figure(figsize=(5, 0.5))
                 plt.plot(range(len(groups_info.dropna(how='all', subset=['lower', 'upper'])['lower'])),
                          groups_info.dropna(how='all', subset=['lower', 'upper'])['woe'], color='red')
@@ -1316,9 +1711,9 @@ class FeatureWOE:
         else:
             trend = ''
             trend_type = 'categorical'
-            if verbose:
+            if verbose > 0:
                 print('Categorical feature. Skipping trend check...')
-        if verbose:
+        if verbose > 0:
             print('...Passed!' if trend_type != 'no trend' else '...Failed!')
         return trend_type, [self.feature, 0, trend, trend_type]
     
@@ -1339,20 +1734,19 @@ class FeatureWOE:
         ----------
         Boolean - whether the check was successful and dictionary of gini values for all available samples
         '''
-        if verbose:
+        if verbose > 0:
             print('\n------------------ Gini checks -------------------')
 
         gini_correct = True
-        f_WOE = self.feature + '_WOE'
+        f_WOE = add_suffix(self.feature)
         for name in self.ds.samples:
             if name != self.ds.train_name:
                 self.ds.samples[name][f_WOE] = self.set_avg_woes(data=self.ds.samples[name][self.feature])
-        self.ds.calc_gini(features=[f_WOE], mode=1)
-        gini_values = {name: self.ds.ginis[name][f_WOE] for name in self.ds.samples}
+        gini_values = self.ds.calc_gini(features=[f_WOE], samples=list(self.ds.samples)).T[f_WOE].to_dict()
         for name, gini in gini_values.items():
             if gini < gini_threshold and (name == self.ds.train_name or with_test):
                 gini_correct = False
-                if verbose:
+                if verbose > 0:
                     print(f'Gini {name} is less then threshold {gini_threshold}')
             if name != self.ds.train_name and with_test:
                 if gini_decrease_threshold < 1:
@@ -1361,17 +1755,17 @@ class FeatureWOE:
                     decrease = gini_values[self.ds.train_name] - gini
                 if decrease > gini_decrease_threshold or (gini_increase_restrict and -decrease > gini_decrease_threshold):
                     gini_correct = False
-                    if verbose:
+                    if verbose > 0:
                         print(f'Gini change from {self.ds.train_name} to {name} is greater then threshold: {round(decrease, self.round_woe)} > {gini_decrease_threshold}')
         if self.ds.bootstrap_base is not None and gini_correct:
             self.ds.bootstrap_base[f_WOE] = self.set_avg_woes(data=self.ds.bootstrap_base[self.feature])
-            self.ds.calc_gini(features=[f_WOE], mode=-1)
-            gini_values['Bootstrap mean'] = self.ds.ginis['Bootstrap mean'][f_WOE]
-            gini_values['Bootstrap std'] = self.ds.ginis['Bootstrap std'][f_WOE]
+            gini_df = self.ds.calc_gini(features=[f_WOE], samples=['Bootstrap'])
+            gini_values['Bootstrap mean'] = gini_df.at[f_WOE, 'Bootstrap mean']
+            gini_values['Bootstrap std'] = gini_df.at[f_WOE, 'Bootstrap std']
             gini_5 = gini_values['Bootstrap mean'] - 1.96*gini_values['Bootstrap std']
             if gini_5 < gini_threshold:
                 gini_correct = False
-                if verbose:
+                if verbose > 0:
                     print(f'Less then 95% of gini distribution is greater then threshold: (mean-1.96*std) {round(gini_5, self.round_woe)} < {gini_threshold}')
             if gini_decrease_threshold < 1:
                 decrease = 1.96*gini_values['Bootstrap std']/gini_values['Bootstrap mean']
@@ -1379,12 +1773,12 @@ class FeatureWOE:
                 decrease = 1.96*gini_values['Bootstrap std']
             if decrease > gini_decrease_threshold:
                 gini_correct = False
-                if verbose:
+                if verbose > 0:
                     if gini_decrease_threshold < 1:
                         print(f'Gini deviation from mean for 95% of distribution is greater then threshold: (1.96*std/mean) {round(decrease,self.round_woe)} > {gini_decrease_threshold}')
                     else:
                         print(f'Gini deviation for 95% of distribution is greater then threshold: (1.96*std) {round(decrease, self.round_woe)} > {gini_decrease_threshold}')
-        if verbose:
+        if verbose > 0:
             print(pd.DataFrame(gini_values, index=['Gini']).round(self.round_woe).to_string())
             print('...Passed!' if gini_correct else '...Failed!')
         return gini_correct, gini_values
@@ -1424,7 +1818,7 @@ class FeatureWOE:
                 return 0
             return 1
 
-        if verbose:
+        if verbose > 0:
             print('\n---------------- WOE order checks ----------------')
         tmp = self.ds.samples[self.ds.train_name].copy()
         tmp = tmp[tmp['group'] >= -1]
@@ -1442,10 +1836,10 @@ class FeatureWOE:
             out_er[name] = out_er['group'].map(group_er)
             if with_test:
                 if not correct_order(out_woes[['group', self.ds.train_name, name]].copy(), group_er, miss_is_incorrect):
-                    if verbose:
+                    if verbose > 0:
                         print(f'...Failed!/nTrend breaking on sample {name}')
                     return False, out_woes, out_er
-                elif verbose:
+                elif verbose > 0:
                     print(f'Trend holding on sample {name}')
         if self.ds.bootstrap_base is not None:
             bootstrap_correct = []
@@ -1458,12 +1852,12 @@ class FeatureWOE:
                 out_er[name] = out_er['group'].map(group_er)
                 bootstrap_correct.append(correct_order(out_woes[['group', self.ds.train_name, name]].copy(), group_er, miss_is_incorrect))
             result = sum(bootstrap_correct)/len(bootstrap_correct) >= correct_threshold
-            if verbose:
+            if verbose > 0:
                 print(f'Trend holding on {sum(bootstrap_correct)}/{len(bootstrap_correct)} bootstrap samples, threshold = {correct_threshold}')
                 print('...Passed!' if result else '...Failed!')
             return result, out_woes, out_er
         else:
-            if verbose:
+            if verbose > 0:
                 print('No bootstrap samples were found is self.ds object/n...Passed!.')
             return True, out_woes, out_er
 
@@ -1548,28 +1942,39 @@ class FeatureWOE:
                     checks[i] = pd.DataFrame()
             return checks
 
-        f_WOE = self.feature + '_WOE'
+        f_WOE = add_suffix(self.feature)
         checks = [[] for i in range(6)]
         gini_V = 0
         check_dfs_V = [[] for i in range(6)]
         n_bins_fact = max_n_bins + 1
         iteration = 0
-        if verbose:
+        if verbose > 0:
             print(f"\n{f' Auto binning for {self.feature} ':-^100}\n")
+        self.woe_threshold_missing = WOEM_woe_threshold if WOEM_on and WOEM_with_missing else 0
         for n_bins in range(max_n_bins, 1, -1):
             if n_bins >= n_bins_fact:
                 continue
             iteration +=1
-            if verbose:
+            if verbose > 0:
                 print(f"\n{f' Searching for the best split into {n_bins} groups ':-^75}\n")
-
             try:
                 self.fit(new_groups=True, to_history=False, verbose=verbose, method=method, max_n_bins=n_bins,
                          min_bin_size=min_bin_size, monotonic=BL_on and (BL_allow_Vlogic_to_increase_gini == 100) or (gini_V > 0),
                          criterion=criterion, scoring=scoring, max_depth=max_depth, solver=solver, divergence=divergence)
             except Exception as e:
-                print(f'Exception! Feature {self.feature}, fit: {e}')
+                if self.categorical_type:
+                    values = self.ds.samples[self.ds.train_name][self.feature].dropna().unique().tolist()
+                    try:
+                        self.groups = {0: sorted(values)}
+                    except:
+                        self.groups = {0: values}
+                else:
+                    self.groups = {0: [-np.inf, np.inf]}
+                self.fit(new_groups=False)
+                if verbose != -1:
+                    print(f'Exception! Feature {self.feature}, fit: {e}')
                 checks[0].append([self.feature, iteration, n_bins, 'Exception', f'Fit: {e}'])
+                checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.calc_gini(features=[f_WOE], samples=[self.ds.train_name]).values[0][0]})
                 continue
 
             n_bins_fact = len([x for x in self.woes if not pd.isnull(self.woes[x]) and x != -1 and not isinstance(x, str)])
@@ -1577,19 +1982,22 @@ class FeatureWOE:
                 try:
                     self.merge_by_size(target_threshold=SM_target_threshold, size_threshold=SM_size_threshold, verbose=verbose)
                 except Exception as e:
-                    print(f'Exception! Feature {self.feature}, Merging by size: {e}')
+                    if verbose != -1:
+                        print(f'Exception! Feature {self.feature}, Merging by size: {e}')
 
             if WOEM_on:
                 try:
-                    self.merge_by_woe(woe_threshold=WOEM_woe_threshold, with_missing=WOEM_with_missing, verbose=verbose)
+                    self.merge_by_woe(woe_threshold=WOEM_woe_threshold, verbose=verbose)
                 except Exception as e:
-                    print(f'Exception! Feature {self.feature}, Merging by WOE: {e}')
+                    if verbose != -1:
+                        print(f'Exception! Feature {self.feature}, Merging by WOE: {e}')
 
             checks[5].append(self.export_scorecard(iteration=iteration))
             if len([x for x in self.woes if not pd.isnull(self.woes[x])]) == 1:
-                if verbose:
+                if verbose > 0:
                     print(f'After the attempt with {n_bins} groups only one group remains. Continue cycle...')
                 checks[0].append([self.feature, iteration, n_bins_fact, 'Failure', 'After merging only one group remains'])
+                checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.calc_gini(features=[f_WOE], samples=[self.ds.train_name]).values[0][0]})
                 continue
             self.to_history(dupl=False)
 
@@ -1597,17 +2005,16 @@ class FeatureWOE:
                 try:
                     BL_trend_type, BL_check = self.BusinessLogicChecker(BL_allow_Vlogic_to_increase_gini=BL_allow_Vlogic_to_increase_gini if gini_V == 0 else 100, verbose=verbose)
                 except Exception as e:
-                    print(f'Exception! Feature {self.feature}, Business logic checks: {e}')
-                    self.ds.calc_gini(features=[f_WOE], mode=1)
+                    if verbose != -1:
+                        print(f'Exception! Feature {self.feature}, Business logic checks: {e}')
                     checks[0].append([self.feature, iteration, n_bins_fact, 'Exception', f'Business logic checks: {e}'])
-                    checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.ginis[self.ds.train_name][f_WOE]})
+                    checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.calc_gini(features=[f_WOE], samples=[self.ds.train_name]).values[0][0]})
                     continue
                 BL_check[1] = iteration
                 checks[1].append(BL_check)
                 if BL_trend_type == 'no trend':
-                    self.ds.calc_gini(features=[f_WOE], mode=1)
                     checks[0].append([self.feature, iteration, n_bins_fact, 'Failure', 'Business logic check failed'])
-                    checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.ginis[self.ds.train_name][f_WOE]})
+                    checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: self.ds.calc_gini(features=[f_WOE], samples=[self.ds.train_name]).values[0][0]})
                     continue
 
             if G_on:
@@ -1616,7 +2023,8 @@ class FeatureWOE:
                            gini_decrease_threshold=G_gini_decrease_threshold,
                            gini_increase_restrict=G_gini_increase_restrict, verbose=verbose, with_test=G_with_test)
                 except Exception as e:
-                    print(f'Exception! Feature {self.feature}, Gini checks: {e}')
+                    if verbose != -1:
+                        print(f'Exception! Feature {self.feature}, Gini checks: {e}')
                     checks[0].append([self.feature, iteration, n_bins_fact, 'Exception', f'Gini checks: {e}'])
                     continue
                 checks[2].append({**{'feature': self.feature, 'iteration': iteration}, **gini_values})
@@ -1624,8 +2032,7 @@ class FeatureWOE:
                     checks[0].append([self.feature, iteration, n_bins_fact, 'Failure', 'Gini check failed'])
                     continue
             else:
-                self.ds.calc_gini(features=[f_WOE], mode=1)
-                gini_values = {self.ds.train_name: self.ds.ginis[self.ds.train_name][f_WOE]}
+                gini_values = self.ds.calc_gini(features=[f_WOE], samples=[self.ds.train_name]).T[f_WOE].to_dict()
                 checks[2].append({'feature': self.feature, 'iteration': iteration, self.ds.train_name: gini_values[self.ds.train_name]})
 
             if WOEO_on:
@@ -1634,7 +2041,8 @@ class FeatureWOE:
                             correct_threshold=WOEO_correct_threshold, woe_adjust=self.woe_adjust,
                             miss_is_incorrect=WOEO_miss_is_incorrect, with_test=WOEO_with_test, verbose=verbose)
                 except Exception as e:
-                    print(f'Exception! Feature {self.feature}, WOE order checks: {e}')
+                    if verbose != -1:
+                        print(f'Exception! Feature {self.feature}, WOE order checks: {e}')
                     checks[0].append([self.feature, iteration, n_bins_fact, 'Exception', f'WOE order checks: {e}'])
                     continue
                 add_woe.insert(loc=0, column='feature', value=self.feature)
@@ -1655,7 +2063,7 @@ class FeatureWOE:
                     for i in range(6):
                         if len(checks[i]) > 0:
                             check_dfs_V[i] = checks[i][-1].copy()
-                if verbose:
+                if verbose > 0:
                     print('Business logic is V-shaped, keep iterating to compare with the monotonic trend.')
                 continue
 
@@ -1672,7 +2080,7 @@ class FeatureWOE:
                             else:
                                 check_dfs_V[i]['iteration'] = iteration
                             checks[i].append(check_dfs_V[i])
-                    if verbose:
+                    if verbose > 0:
                         print(f'Finally V-shaped binning with {fact_number_groups_V} groups is chosen, because it gives an increase gini by {round(gini_delta, self.round_woe)}')
             return True, checks_to_dfs(checks)
         else:
@@ -1686,10 +2094,10 @@ class FeatureWOE:
                         else:
                             check_dfs_V[i]['iteration'] = iteration
                         checks[i].append(check_dfs_V[i])
-                if verbose:
+                if verbose > 0:
                     print(f'Finally V-shaped binning with {fact_number_groups_V} groups is chosen, because other binnings do not pass checks')
                 return True, checks_to_dfs(checks)
-            if verbose:
+            if verbose > 0:
                 print('After all attempts no suitable binning was found.')
             return False, checks_to_dfs(checks)
 
@@ -1740,7 +2148,7 @@ class FeatureWOE:
                         rounded_groups[k] = [round(v[0], self.round_digits), round(v[1], self.round_digits)]
                     else:
                         rounded_groups[k] = v
-                if verbose:
+                if verbose > 0:
                     if change_rounds:
                         print ('The rounding parameter is too large, setting to', self.round_digits)
                 self.groups = rounded_groups
@@ -1778,10 +2186,21 @@ class FeatureWOE:
                         rounded_groups[k] = v
 
                 if rounded_edges!=exact_edges:
-                    if verbose:
+                    if verbose > 0:
                         print ('Rounding edges:', str([exact_edges[i] for i in range(len(exact_edges)) if exact_edges[i]!=rounded_edges[i]]),
                                'to', str([rounded_edges[i] for i in range(len(rounded_edges)) if exact_edges[i]!=rounded_edges[i]]))
                     self.groups = rounded_groups
+
+    def calc_woes(self, simple=False):
+        if self.simple or simple:
+            return self.calc_simple_woes()
+        else:
+            try:
+                woe_folds = self.calc_woe_folds()[0]
+                return {group: round(np.mean(np.array([woe_folds[group][fold] for fold in woe_folds[group]])), self.round_woe) for group in woe_folds}
+            except ValueError:
+                print ('ValueError for WOE calculation. Please check n_folds parameter and group sizes. Turning to simple WOE calculation... Hope it works.')
+                return self.calc_simple_woes()
 
     def woe_fit(self, verbose=False, missings_to_process=True):
         '''
@@ -1790,32 +2209,24 @@ class FeatureWOE:
         # optimal alpha calculation
         if self.alpha_recalc:
             self.alpha = self.optimize_alpha()
-            if verbose:
+            if verbose > 0:
                 print(f'Optimal alpha: {self.alpha}')
-        woes = {}
-        if self.simple:
-            woes = self.calc_simple_woes()
-        else:
-            try:
-                woes = self.average_fold_woe(self.calc_woe_folds()[0])
-            except ValueError:
-                print ('ValueError for WOE calculation. Please check n_folds parameter and group sizes. Turning to simple WOE calculation... Hope it works.')
-                woes = self.calc_simple_woes()
+        woes = self.calc_woes()
         if missings_to_process:
             woes_no_miss = copy.deepcopy(woes)
             woe_miss = woes_no_miss[-1]
-            woes_no_miss = {k:v for k, v in woes_no_miss.items() if k >= 0}
+            woes_no_miss = {k: v for k, v in woes_no_miss.items() if k >= 0}
             if self.missing_process == 'min':
                 self.missing_group = min(woes_no_miss, key=woes_no_miss.get)
             elif self.missing_process == 'max':
                 self.missing_group = max(woes_no_miss, key=woes_no_miss.get)
-            elif self.missing_process == 'nearest':
+            elif self.missing_process == 'nearest' or any([abs(w - woe_miss) < self.woe_threshold_missing for w in woes_no_miss.values()]):
                 nearest_group, nearest_woe = self.find_nearest(woe_miss, woes_no_miss)
                 self.missing_group = nearest_group
             if self.missing_group != -1:
                 del self.groups[-1]
                 self.set_groups(inplace=True)
-                woes = self.calc_simple_woes()
+                woes = self.calc_woes()
 
         if self.others_process in ['missing_or_min', 'missing_or_max']:
             if self.missing_group in woes:
@@ -1830,6 +2241,7 @@ class FeatureWOE:
             self.others_woe = max(woes.values())
         else:
             self.others_woe = self.others_process
+        self.woes = woes
         return woes
 
     def categorical_to_interval(self, data):
@@ -1840,7 +2252,7 @@ class FeatureWOE:
         # turning categorical values into separate groups for pre-woe
         self.groups = {group: [value] for group, value in enumerate(data.dropna().unique())}
         self.set_groups(inplace=True)
-        self.woes = self.calc_simple_woes()
+        self.woes = self.calc_woes(simple=True)
         return self.set_avg_woes(data=data)
 
     def get_tree_splits(self, dtree):
@@ -1879,16 +2291,13 @@ class FeatureWOE:
         values: dict or list of possible nearest values
         '''
         if isinstance(values, dict):
-            diff = {}
-            for (k, v) in values.items():
-                diff[abs(v-x)] = k
+            diff = {abs(v-x): k for (k, v) in values.items()}
             return diff[min(diff)], values[diff[min(diff)]]
-        elif isinstance(values, list) or  isinstance(values, np.ndarray):
+        elif isinstance(values, list) or isinstance(values, np.ndarray):
             diff = abs(np.array(values) - x)
             return diff.index(min(diff)), values[diff.index(min(diff))]
 
-    @staticmethod
-    def fit_gridsearch(x_train, y_train, parameters_grid, criterion, scoring):
+    def fit_gridsearch(self, x_train, y_train, parameters_grid, criterion, scoring):
         '''
         TECH
 
@@ -1905,9 +2314,8 @@ class FeatureWOE:
         The best decision tree
         '''
 
-        dtree = DecisionTreeClassifier(criterion=criterion)
-        test_fold = [-1 for x in range(x_train.shape[0])] + [0 for x in range(x_train.shape[0])]
-        gridsearch = GridSearchCV(dtree, parameters_grid, scoring=scoring, cv=7)
+        gridsearch = GridSearchCV(DecisionTreeClassifier(criterion=criterion, random_state=self.ds.random_state),
+                                  parameters_grid, scoring=scoring, cv=7)
         gridsearch.fit(x_train[:, None], y_train)
         return gridsearch.best_estimator_
 
@@ -1920,8 +2328,7 @@ class FeatureWOE:
             for group, vals in self.groups.items():
                 if isinstance(vals, list):
                     for category, pre_woe in self.woes.items():
-                        if category in pre_groups and not pd.isnull(pre_woe) and pre_woe >= vals[0] and pre_woe < vals[
-                            1]:
+                        if category in pre_groups and not pd.isnull(pre_woe) and pre_woe >= vals[0] and pre_woe < vals[1]:
                             if pd.isnull(pre_groups[category]):
                                 self.missing_group = group
                             else:
@@ -2031,10 +2438,8 @@ class FeatureWOE:
         # WOE calculation
         self.groups = dict(sorted(self.groups.items()))
         self.set_groups(inplace=True)
-        self.woes = self.woe_fit(verbose=verbose, missings_to_process=missings_to_process)
-        self.ds.samples[self.ds.train_name][self.feature + '_WOE'] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
-        self.ds.ginis = {}
-        self.ds.ginis_in_time = {}
+        self.woe_fit(verbose=verbose, missings_to_process=missings_to_process)
+        self.ds.samples[self.ds.train_name][add_suffix(self.feature)] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
         if to_history:
             self.to_history()
         if len(self.groups) != len(self.woes):
@@ -2044,7 +2449,7 @@ class FeatureWOE:
                 del self.groups[-1]
             elif  verbose:
                 print ('WARNING! Number of groups is not certain! We have', len(self.groups), 'groups and', len(self.woes), 'woes!')
-        if verbose:
+        if verbose > 0:
             self.print_woe()
 
     def merge(self, groups_list, verbose=False):
@@ -2060,7 +2465,7 @@ class FeatureWOE:
         # existing groups
         for group in groups_list:
             if group not in self.groups:
-                print(f'Group {group} is incorrect! Correct values are {groups_list}')
+                print(f'Group {group} is incorrect! Correct values are {list(self.groups)}')
                 return None
         # only 2 groups per merge call
         if len(groups_list) != 2:
@@ -2071,7 +2476,7 @@ class FeatureWOE:
         if not self.categorical_type:
             if -1 not in groups_list:
                 if self.groups[groups_list[0]][0] != self.groups[groups_list[1]][1] and self.groups[groups_list[1]][0] != self.groups[groups_list[0]][1]:
-                    print ('Please enter neighbouring groups. Good luck.')
+                    print ('Please enter neighbouring groups.')
                     return None
 
         # merging groups in self.groups
@@ -2162,8 +2567,8 @@ class FeatureWOE:
                 tmp_woes[g] = self.woes[g - 1]
         tmp_groups[max(self.groups) + 1] = self.groups[max(self.groups)].copy()
         tmp_woes[max(self.woes) + 1] = self.woes[max(self.woes)]
-        if self.missing_group>group:
-            self.missing_group=self.missing_group+1
+        if self.missing_group > group:
+            self.missing_group = self.missing_group+1
         self.groups = tmp_groups
         self.woes = tmp_woes
         self.groups[new_group_num] = [add_bound, self.groups[group][1]]
@@ -2179,8 +2584,20 @@ class FeatureWOE:
         group: a group to split, integer
         to_add: in case of interval - a user-defined bound for the split (the intermediate bound of the interval), only for ordered features; in case of categorical -  a user-defined new group of values, consists of values from the group to split and the other values of the group will be separated. Only for categorical features. Example: group = [1, 2, 4, 6, 9], new_group = [1, 2, 9] => the two new groups will be [1, 2, 9], [4, 6]. For the same result we could set new_group parameter = [4, 6]
         '''
-        if group == -1:
-            print ('Invalid group!')
+        if group is None:
+            if self.categorical_type:
+                for g in self.groups:
+                    if to_add[0] in self.groups[g]:
+                        group = g
+                        break
+            else:
+                for g, v in self.groups.items():
+                    if to_add >= v[0] and to_add < v[1]:
+                        group = g
+                        break
+
+        if group is None or group == -1:
+            print('Invalid group!')
             return None
 
         if isinstance(to_add, int) or isinstance(to_add, float):
@@ -2253,56 +2670,38 @@ class FeatureWOE:
                         self.insert_new_bound(group, add_bound)
                     gc.collect()
             else:
-                print('All observations in the specified group have the same target value =', samples_to_process[self.ds.target].unique()[0])
+                print(f'All observations in the specified group have the same target value {df[self.ds.target].unique()[0]}')
 
-    def merge_by_woe(self, woe_threshold=0.05, with_missing=True, verbose=False):
+    def merge_by_woe(self, woe_threshold=0.05, verbose=False):
         '''
         Merges all groups, close by WOE (for interval features only neighboring groups and missing group are checked)
 
         Parameters
         -----------
         woe_threshold: if woe difference between groups (neighboring groups for interval) is less then this threshold, then they are to be merged
-        with_missing: should woe difference with missing group also be checked
         '''
-        if verbose:
+        if verbose > 0:
             print('\n----------------- Merging by WOE -----------------')
-        if len([x for x in self.woes if pd.isnull(self.woes[x])==False])>1:
-            to_check_woe=True
-        else:
-            to_check_woe=False
 
-        while to_check_woe:
-            to_check_woe=False
+        for _ in range(len(self.groups.copy())):
+            groups_stat = self.calc_groups_stat()
+            groups_stat = groups_stat[groups_stat.index >= 0].reset_index()
+            if self.categorical_type:
+                groups_stat = groups_stat.sort_values(by=['woe'])
+            groups_stat['woe_diff'] = (groups_stat['woe'] - groups_stat['woe'].shift(-1)).abs()
+            groups_stat['merge_to'] = groups_stat['group'].shift(-1)
+            groups_stat = groups_stat[(groups_stat['woe_diff'] < woe_threshold) & (groups_stat['woe_diff'] == groups_stat['woe_diff'].min())]
 
-            groups_dna = [x for x in self.woes if x >=0]
-            min_woe_dif=None
-            if with_missing and -1 in self.woes:
-                if self.woes[-1] is not None:
-                    if min_woe_dif is None or abs(self.woes[groups_dna[0]]-self.woes[-1])<min_woe_dif:
-                        min_woe_dif=abs(self.woes[groups_dna[0]]-self.woes[-1])
-                        min_group=-1
-                        max_group=groups_dna[0]
-            for i in range(len(groups_dna)-1):
-                if min_woe_dif is None or abs(self.woes[groups_dna[i]]-self.woes[groups_dna[i+1]])<min_woe_dif:
-                    min_woe_dif=abs(self.woes[groups_dna[i]]-self.woes[groups_dna[i+1]])
-                    min_group=groups_dna[i]
-                    max_group=groups_dna[i+1]
-                if with_missing and -1 in self.woes:
-                    if self.woes[-1] is not None:
-                        if min_woe_dif is None or abs(self.woes[groups_dna[i+1]]-self.woes[-1])<min_woe_dif:
-                            min_woe_dif=abs(self.woes[groups_dna[i+1]]-self.woes[-1])
-                            min_group=-1
-                            max_group=groups_dna[i+1]
-
-            if min_woe_dif is not None and min_woe_dif<woe_threshold:
-                to_check_woe=True
-                if verbose:
-                    print(f'\nMerging of two groups close by WOE: {[min_group, max_group]}')
-                self.merge([min_group, max_group], verbose=verbose)
-            elif verbose:
-                print('No groups with close WOE.')
-                print('...Done')
-
+            if not groups_stat.empty:
+                merge_groups = list(groups_stat[['group', 'merge_to']].astype('int').values[0])
+                if verbose > 0:
+                    print(f'\nMerging of two groups close by WOE: {merge_groups}')
+                self.merge(merge_groups, verbose=verbose)
+            else:
+                if verbose > 0:
+                    print('No groups with close WOE.')
+                    print('...Done')
+                break
 
     def merge_by_size(self, target_threshold=5, size_threshold=100, verbose=False):
         '''
@@ -2313,57 +2712,35 @@ class FeatureWOE:
         target_threshold: min number of targets for group to not be considered small
         size_threshold: min number of observations for group to not be considered small
         '''
-        if verbose:
+        if verbose > 0:
             print('\n---------------- Merging by size -----------------')
-        if len([x for x in self.woes if pd.isnull(self.woes[x])==False])>1:
-            to_check_size=True
-        else:
-            to_check_size=False
 
-        while to_check_size:
-            to_check_size=False
+        for _ in range(len(self.groups.copy())):
+            groups_stat = self.calc_groups_stat()
+            groups_stat = groups_stat[groups_stat.index >= 0].reset_index()
+            if self.categorical_type:
+                groups_stat = groups_stat.sort_values(by=['woe'])
+            if target_threshold < 1:
+                groups_stat['n1'] = groups_stat['n1'] / groups_stat['n']
+            groups_stat['small'] = (groups_stat['n1'] < target_threshold) | (groups_stat['n'] < size_threshold)
+            groups_stat['woe_diff1'] = np.where(groups_stat['small'], (groups_stat['woe'] - groups_stat['woe'].shift(1)).abs(), np.nan)
+            groups_stat['woe_diff2'] = np.where(groups_stat['small'], (groups_stat['woe'] - groups_stat['woe'].shift(-1)).abs(), np.nan)
+            groups_stat['woe_diff'] = groups_stat[['woe_diff1', 'woe_diff2']].min(axis=1)
+            groups_stat['merge_to'] = np.where(groups_stat['woe_diff'] != groups_stat['woe_diff'].min(), np.nan,
+                                               np.where(groups_stat['woe_diff'] == groups_stat['woe_diff1'], groups_stat['group'].shift(1),
+                                                        np.where(groups_stat['woe_diff'] == groups_stat['woe_diff2'], groups_stat['group'].shift(-1), np.nan)))
+            groups_stat = groups_stat.dropna(subset=['merge_to'])
 
-            woes_dna={x:self.woes[x] for x in self.woes if self.woes[x] is not None and (x >=0 or self.categorical_type)}
-            if len(woes_dna)<=1:
+            if not groups_stat.empty:
+                merge_groups = list(groups_stat[['group', 'merge_to']].astype('int').values[0])
+                if verbose > 0:
+                    print(f'\nMerging small group {merge_groups[0]} (by target or size) to the closest by WoE group {merge_groups[1]}')
+                self.merge(merge_groups, verbose=verbose)
+            else:
+                if verbose > 0:
+                    print('No small groups.')
+                    print('...Done')
                 break
-
-            group_stats=self.ds.samples[self.ds.train_name].groupby(self.feature+'_WOE').agg(target=(self.ds.target, 'sum'), amount=(self.ds.target, 'size'))
-            targets={x:group_stats.loc[self.woes[x]]['target'] for x in sorted(woes_dna, key=woes_dna.get if self.categorical_type else None) if x!=-1 or self.categorical_type}
-            amounts={x:group_stats.loc[self.woes[x]]['amount'] for x in sorted(woes_dna, key=woes_dna.get if self.categorical_type else None) if x!=-1 or self.categorical_type}
-
-            min_woe_dif=None
-            targets_list = list(targets.keys())
-
-            for i, t in enumerate(targets):
-                if (target_threshold>=1 and targets[t]<target_threshold) or \
-                (target_threshold<1 and targets[t]/amounts[t]<target_threshold) or \
-                amounts[t]<size_threshold:
-                    if i==0:
-                        nearest_group=targets_list[i+1]
-                        woe_dif=abs(self.woes[t]-self.woes[targets_list[i+1]])
-                    elif i==len(targets)-1:
-                        nearest_group=targets_list[i-1]
-                        woe_dif=abs(self.woes[t]-self.woes[targets_list[i-1]])
-                    else:
-                        if abs(self.woes[t]-self.woes[targets_list[i+1]])<abs(self.woes[t]-self.woes[targets_list[i-1]]):
-                            nearest_group=targets_list[i+1]
-                            woe_dif=abs(self.woes[t]-self.woes[targets_list[i+1]])
-                        else:
-                            nearest_group=targets_list[i-1]
-                            woe_dif=abs(self.woes[t]-self.woes[targets_list[i-1]])
-                    if min_woe_dif is None or min_woe_dif>woe_dif:
-                        group_from=t
-                        group_to=nearest_group
-                        min_woe_dif=woe_dif
-
-            if min_woe_dif is not None:
-                to_check_size=True
-                if verbose:
-                    print(f'\nMerging small group {group_from} (by target or size) to the closest by WoE group {group_to}')
-                self.merge([group_from, group_to], verbose=verbose)
-            elif verbose:
-                print('No small groups.')
-                print('...Done')
 
     def transform(self):
         '''
@@ -2378,14 +2755,12 @@ class FeatureWOE:
         transformed Data object
         '''
         if self.ds.samples is not None:
-            f_WOE = self.feature.rsplit('_WOE', maxsplit=1)[0] + '_WOE'
+            f_WOE = add_suffix(self.feature)
             for name, sample in self.ds.samples.items():
                 self.ds.samples[name][f_WOE] = self.set_avg_woes(data=(self.ds.samples[name][self.feature]))
             if self.ds.bootstrap_base is not None:
                 self.ds.bootstrap_base[f_WOE] = self.set_avg_woes(data=(self.ds.bootstrap_base[self.feature]))
             self.ds.features = [f_WOE]
-        self.ds.ginis = {}
-        self.ds.ginis_in_time = {}
         return self.ds
 
     def export_scorecard(self, iteration=None, full=True):
@@ -2396,17 +2771,16 @@ class FeatureWOE:
         ----------
         dataframe with binning information
         '''
-        if iteration is None:
-            iteration = len(self.history)
         # searching for WOE for each interval of values
-        if self.groups_stat is not None:
-            scorecard = self.groups_stat.copy().reset_index()
+        if self.ds is not None:
+            scorecard = self.calc_groups_stat().reset_index()
         else:
             scorecard = pd.DataFrame.from_dict(self.woes, orient='index').reset_index().set_axis(['group', 'woe'], axis=1)
             scorecard['n'] = np.nan
             scorecard['n0'] = np.nan
             scorecard['n1'] = np.nan
         scorecard['values'] = scorecard['group'].map(self.groups)
+        scorecard = scorecard[scorecard['group'] != 404]
         scorecard = pd.concat([scorecard, pd.DataFrame({'group': 'others', 'values': 'all others', 'woe': self.others_woe}, index=[0])])
         scorecard['categorical_type'] = self.categorical_type
         scorecard['missing'] = np.where(scorecard['group'] == self.missing_group, 1, 0)
@@ -2416,9 +2790,8 @@ class FeatureWOE:
         scorecard['sample_part'] = scorecard['n'] / scorecard['n'].sum()
         scorecard['n0_part'] = scorecard['n0'] / scorecard['n0'].sum()
         scorecard['n1_part'] = scorecard['n1'] / scorecard['n1'].sum()
-        scorecard['iteration'] = iteration
-        for col in ['target_rate', 'sample_part', 'n0_part', 'n1_part']:
-            scorecard[col] = scorecard[col].round(self.round_woe)
+        scorecard['iteration'] = iteration if iteration is not None else len(self.history)
+        scorecard[['target_rate', 'sample_part', 'n0_part', 'n1_part']] = scorecard[['target_rate', 'sample_part', 'n0_part', 'n1_part']].round(self.round_woe)
         for i, group in enumerate(self.special_bins.keys()):
             scorecard.loc[scorecard['group'] == -2 - i, 'group'] = group
         if not full:
@@ -2441,7 +2814,7 @@ class FeatureWOE:
             self.missing_group = self.history[iteration]['missing_group']
             self.others_woe = self.history[iteration]['others_woe']
             self.set_groups(inplace=True)
-            self.ds.samples[self.ds.train_name][self.feature + '_WOE'] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
+            self.ds.samples[self.ds.train_name][add_suffix(self.feature)] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
             self.is_active = True
             gc.collect()
         else:
@@ -2499,7 +2872,7 @@ class FeatureWOE:
         self.is_active = True
         for iter, woe_df in scorecard.groupby('iteration'):
             try:
-                self.others_woe =  woe_df[woe_df['group'] == 'others']['woe'].iloc[0]
+                self.others_woe = woe_df[woe_df['group'] == 'others']['woe'].iloc[0]
             except:
                 self.others_woe = np.nan
             woe_df = woe_df[~woe_df['group'].isin(['others'])]
@@ -2559,7 +2932,314 @@ class FeatureWOE:
                 self.woes = woe_df.set_index('group')['woe'].to_dict()
                 if self.ds.samples is not None and iter == scorecard['iteration'].max():
                     self.set_groups(inplace=True)
-                    self.ds.samples[self.ds.train_name][self.feature + '_WOE'] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
-                    if verbose:
+                    self.ds.samples[self.ds.train_name][add_suffix(self.feature)] = self.ds.samples[self.ds.train_name]['group'].map(self.woes)
+                    if verbose > 0:
                         self.print_woe()
                 self.to_history(dupl=False)
+
+
+class FeatureCross:
+    '''
+    ВОЕ-трансформация для кросс-переменных. Для каждой переменной первого уровня должэен быть создан свой эксземпляр
+    '''
+
+    def __init__(self, feature_woe):
+        """
+        :param feature_woe: объект FeatureWOE переменной первого уровня
+        """
+        self.feature_woe = copy.deepcopy(feature_woe)
+        self.cross = {}
+
+    def add_f2_features(self, feature_woes):
+        group_idx = {}
+        if self.feature_woe.ds.samples is not None:
+            for sample in self.feature_woe.ds.samples:
+                if sample != self.feature_woe.ds.train_name:
+                    df_s = self.feature_woe.ds.samples[sample].copy()
+                    df_s['group'] = self.feature_woe.set_groups(data=df_s[self.feature_woe.feature])
+                else:
+                    df_s = self.feature_woe.ds.samples[sample]
+                group_idx[sample] = {group: [df_s.index.get_loc(idx) for idx in df_sg.index] for group, df_sg in
+                                     df_s.groupby('group')}
+        if self.feature_woe.ds.bootstrap_base is not None:
+            bs = self.feature_woe.ds.bootstrap_base
+            bs['group'] = self.feature_woe.set_groups(data=bs[self.feature_woe.feature])
+            bs_group_idx = {group: {bs.index.get_loc(idx) for idx in tmp.index} for group, tmp in bs.groupby('group')}
+            bootstrap = {
+                group: [list(set(idx) & bs_group_idx[group]) for idx in self.feature_woe.ds.bootstrap] for
+                group in bs_group_idx}
+        for fw in feature_woes:
+            self.cross[fw.feature] = {}
+            for group in self.feature_woe.groups:
+                if fw.ds.samples is not None:
+                    samples = {name: sample.iloc[group_idx[name][group]] for name, sample in fw.ds.samples.items() if group in group_idx[name]}
+                else:
+                    samples = None
+                fw2 = FeatureWOE(DataSamples(samples=samples, target=fw.ds.target, features=fw.ds.features, cat_columns=fw.ds.cat_columns, n_jobs=1, random_state=fw.ds.random_state),
+                                 fw.feature, round_digits=fw.round_digits, round_woe=fw.round_woe,
+                          rounding_migration_coef=fw.rounding_migration_coef, simple=fw.simple, n_folds=fw.n_folds,
+                          woe_adjust=fw.woe_adjust, alpha=fw.alpha, alpha_range=fw.alpha_range,
+                          alpha_scoring=fw.alpha_scoring, alpha_best_criterion=fw.alpha_best_criterion,
+                          missing_process=fw.missing_process, missing_min_part=fw.missing_min_part,
+                          others_process=fw.others_process, opposite_sign_to_others=fw.opposite_sign_to_others,
+                          special_bins=fw.special_bins)
+                if fw.ds.bootstrap_base is not None and self.feature_woe.ds.bootstrap_base is not None:
+                    fw2.ds.bootstrap_base = fw.ds.bootstrap_base
+                    fw2.ds.bootstrap = bootstrap[group]
+                self.cross[fw.feature][group] = fw2
+
+    def fit(self, cross_features=None, new_groups=True, verbose=False, method='tree', max_n_bins=10, min_bin_size=0.05,
+            criterion='entropy', scoring='neg_log_loss', max_depth=None, monotonic=False, solver='cp', divergence='iv'):
+        if cross_features is None:
+            cross_features = list(self.cross)
+        for f2 in cross_features:
+            for group in self.cross[f2]:
+                self.cross[f2][group].fit(new_groups=new_groups, to_history=True, verbose=verbose, method=method, max_n_bins=max_n_bins,
+                     min_bin_size=min_bin_size, monotonic=monotonic, criterion=criterion, scoring=scoring, max_depth=max_depth, solver=solver, divergence=divergence)
+            self.calc_simple_woes(f2)
+            if verbose:
+                self.print_woe(f2)
+
+    def auto_fit(self, cross_features=None, verbose=True, method='tree', max_n_bins=10, min_bin_size=0.05,
+                 criterion='entropy', scoring='neg_log_loss', max_depth=None, solver='cp', divergence='iv',
+                 WOEM_on=True, WOEM_woe_threshold=0.05, WOEM_with_missing=False,
+                 SM_on=True, SM_target_threshold=5, SM_size_threshold=100,
+                 BL_on=True, BL_allow_Vlogic_to_increase_gini=100,
+                 G_on=True, G_gini_threshold=5, G_with_test=False, G_gini_decrease_threshold=0.2,
+                 G_gini_increase_restrict=True,
+                 WOEO_on=False, WOEO_dr_threshold=0.01, WOEO_correct_threshold=0.85, WOEO_miss_is_incorrect=True,
+                 WOEO_with_test=False
+                 ):
+        auto_fit_parameters = {}
+        for f in ['method', 'max_n_bins', 'min_bin_size', 'criterion', 'scoring', 'max_depth', 'solver', 'divergence',
+                  'WOEM_on', 'WOEM_woe_threshold', 'WOEM_with_missing', 'SM_on', 'SM_target_threshold',
+                  'SM_size_threshold',
+                  'G_on', 'G_gini_threshold', 'G_gini_decrease_threshold', 'G_gini_increase_restrict', 'G_with_test',
+                  'WOEO_on', 'WOEO_dr_threshold', 'WOEO_correct_threshold', 'WOEO_miss_is_incorrect', 'WOEO_with_test',
+                  'BL_on', 'BL_allow_Vlogic_to_increase_gini']:
+            auto_fit_parameters[f] = eval(f)
+        if cross_features is None:
+            cross_features = list(self.cross)
+        if not cross_features:
+            return {}, {}
+        check_dfs = {f2: {} for f2 in cross_features}
+        result = {f2: False for f2 in cross_features}
+        for f2 in cross_features:
+            res_group = {}
+            for group in self.cross[f2]:
+                res_group[group], check_dfs[f2][group] = self.cross[f2][group].auto_fit(verbose=-1, **auto_fit_parameters)
+                for i in range(5):
+                    if not check_dfs[f2][group][i].empty:
+                        check_dfs[f2][group][i] = check_dfs[f2][group][i][check_dfs[f2][group][i]['iteration'] == check_dfs[f2][group][i]['iteration'].max()].drop(['iteration'], axis=1)
+                        check_dfs[f2][group][i].insert(loc=0, column='bin1', value=str(self.feature_woe.groups[group]))
+                if not res_group[group]:
+                    if self.cross[f2][group].categorical_type:
+                        values = self.cross[f2][group].ds.samples[self.cross[f2][group].ds.train_name][self.cross[f2][group].feature].dropna().unique().tolist()
+                        try:
+                            self.cross[f2][group].groups = {0: sorted(values)}
+                        except:
+                            self.cross[f2][group].groups = {0: values}
+                    else:
+                        self.cross[f2][group].groups = {0: [-np.inf, np.inf]}
+                    self.cross[f2][group].fit(new_groups=False)
+            result[f2] = any(list(res_group.values()))
+            self.calc_simple_woes(f2)
+            if verbose:
+                self.print_woe(f2)
+        check_dfs = [pd.concat([check_dfs[f2][group][i] for f2 in cross_features for group in check_dfs[f2]]) for i in range(5)] + [self.export_scorecard()]
+        return result, check_dfs
+
+    def calc_simple_woes(self, f2):
+        to_calc = self.feature_woe.ds.samples[self.feature_woe.ds.train_name].merge(pd.concat(
+            [fw.ds.samples[fw.ds.train_name]['group'] for g, fw in
+             self.cross[f2].items()]), left_index=True, right_index=True)
+        to_calc['group'] = '[' + to_calc['group_x'].astype('str') + ', ' + to_calc['group_y'].astype('str') + ']'
+        for g, woe in self.feature_woe.calc_simple_woes(to_calc).items():
+            g_l = json.loads(g)
+            self.cross[f2][g_l[0]].woes[g_l[1]] = woe
+
+    def calc_groups_stat(self, f2):
+        to_calc = self.feature_woe.ds.samples[self.feature_woe.ds.train_name].merge(pd.concat(
+            [fw.ds.samples[fw.ds.train_name]['group'] for g, fw in
+             self.cross[f2].items()]), left_index=True, right_index=True)
+        to_calc['group'] = '[' + to_calc['group_x'].astype('str') + ', ' + to_calc['group_y'].astype('str') + ']'
+        groups_stat = self.feature_woe.calc_groups_stat(to_calc)
+        groups_stat['woe'] = groups_stat.index.map(self.get_woes(f2))
+        return groups_stat
+
+    def print_woe(self, f2):
+        '''
+        Prints WOE parameters in a standard and convenient way
+        '''
+        groups_stat = self.calc_groups_stat(f2).reset_index()
+        groups_stat[['n', 'n1']] = groups_stat[['n', 'n1']].round(0).astype('int')
+        groups_stat['values'] = groups_stat['group'].map(self.get_2values(f2)).astype('str')
+        '''
+        if self.missing_group != -1 and not self.categorical_type:
+            groups_stat.loc[groups_stat['group'] == self.missing_group, 'values'] += ' + missings'
+        for i, group in enumerate(self.special_bins.keys()):
+            groups_stat.loc[groups_stat['group'] == -2 - i, 'group'] = group
+        '''
+        print(f'\nCurrent binning for {cross_name(self.feature_woe.feature, f2)}:')
+        print(groups_stat[['group', 'values', 'woe', 'n', 'n1']].to_string(index=False))
+        print()
+
+    def get_transform_func(self, f2, start=''):
+        groups1 = self.feature_woe.sorted_groups()
+        s = start
+        i = 0
+        for g1 in groups1:
+            fw = self.cross[f2][g1]
+            groups2_list = [g for g in fw.sorted_groups() if g in fw.woes]
+            g1_condition_code = self.feature_woe.get_group_condition_code(g1)
+            for g2 in groups2_list:
+                g2_condition_code = fw.get_group_condition_code(g2)
+                s += f"np.where(({g1_condition_code}) & ({g2_condition_code}), {fw.woes[g2]}, \n" + " " * (len(start) + 9 * (i + 1))
+                i += 1
+        s += f'{self.feature_woe.others_woe}{")" * i}'.replace('nan', 'np.nan')
+        return s
+
+    def set_avg_woes(self, data, f2):
+        '''
+        Replaces all values of a feature to related WOE
+
+        Parameters
+        -----------
+        data: DataFrame, containing initial values of features
+
+        Returns
+        -----------
+        a Series of WOE-transformed feature values
+        '''
+        condlist = []
+        cond_woes = []
+        condlist_1, groups_1 = self.feature_woe.get_condlist(data[self.feature_woe.feature], self.feature_woe.groups)
+        for cond, g in zip(condlist_1, groups_1):
+            condlist_2, groups_2 = self.cross[f2][g].get_condlist(data[f2], self.cross[f2][g].groups)
+            condlist += [c & cond for c in condlist_2]
+            cond_woes += [self.cross[f2][g].woes[g2] for g2 in groups_2]
+        return np.select(condlist, cond_woes, self.feature_woe.others_woe)
+
+    def set_groups(self, data, f2):
+        '''
+        Replaces all values of a feature to related WOE
+
+        Parameters
+        -----------
+        data: DataFrame, containing initial values of features
+
+        Returns
+        -----------
+        a Series of WOE-transformed feature values
+        '''
+        condlist = []
+        cond_groups = []
+        condlist_1, groups_1 = self.feature_woe.get_condlist(data[self.feature_woe.feature], self.feature_woe.groups)
+        for cond, g in zip(condlist_1, groups_1):
+            condlist_2, groups_2 = self.cross[f2][g].get_condlist(data[f2], self.cross[f2][g].groups)
+            condlist += [c & cond for c in condlist_2]
+            cond_groups += [str([g, g2]) for g2 in groups_2]
+        return np.select(condlist, cond_groups, 404)
+
+    def transform(self, features=None):
+        '''
+        Transforms a Data object according to WOE parameters fitted. Can be used only after .fit().
+
+        Parameters
+        ------------
+        data: Data object to transform
+
+        Returns
+        ----------
+        transformed Data object
+        '''
+        if features is None:
+            features = list(self.cross)
+        if self.feature_woe.ds.samples is not None:
+            new_features = []
+            for f2 in features:
+                f_WOE = add_suffix(cross_name(self.feature_woe.feature, f2))
+                for name, sample in self.feature_woe.ds.samples.items():
+                    data = self.feature_woe.ds.samples[name].merge(pd.concat([fw.ds.samples[name][f2] for g, fw in self.cross[f2].items() if name in fw.ds.samples]), how='left', left_index=True, right_index=True)
+                    self.feature_woe.ds.samples[name][f_WOE] = self.set_avg_woes(data, f2)
+                if self.feature_woe.ds.bootstrap_base is not None:
+                    data = self.feature_woe.ds.bootstrap_base.merge(list(self.cross[f2].values())[0].ds.bootstrap_base[f2], how='left', left_index=True, right_index=True)
+                    self.feature_woe.ds.bootstrap_base[f_WOE] = self.set_avg_woes(data, f2)
+                new_features.append(f_WOE)
+            self.feature_woe.ds.features = new_features
+        return self.feature_woe.ds
+
+    def export_scorecard(self, features=None, full=True):
+        '''
+        Transforms self.groups, self.categorical and self.missing_group to dataframe.
+
+        Returns
+        ----------
+        dataframe with binning information
+        '''
+        if features is None:
+            features = self.cross
+        features = [f for f in features if f in self.cross]
+        dfs = []
+        for f2 in features:
+            feature = f'cross_{self.feature_woe.feature}&{f2}'
+            dfs_group = []
+            for group in self.cross[f2]:
+                df = self.cross[f2][group].export_scorecard(full=full)
+                df = df[df['group'] != 'others']
+                df['group'] = '[' + str(group) + ', ' + df['group'].astype('str') + ']'
+                df['values'] = str(self.feature_woe.groups[group]) + ' & ' + df['values'].astype('str')
+                df['missing'] = '[' + str(int(self.feature_woe.missing_group == group)) + ', ' + df['missing'].astype('str') + ']'
+                df['missing'].loc[df['missing'] == '[0, 0]'] = 0
+                dfs_group.append(df)
+            df = pd.concat(dfs_group).reset_index(drop=True)
+            df['feature'] = feature
+            categorical_type = str([self.feature_woe.categorical_type, df['categorical_type'].values[0]]).replace("'","").replace("[, ]","")
+            df['categorical_type'] = categorical_type
+            if full:
+                df['sample_part'] = df['n'] / df['n'].sum()
+                df['n0_part'] = df['n0'] / df['n0'].sum()
+                df['n1_part'] = df['n1'] / df['n1'].sum()
+                df[['sample_part', 'n0_part', 'n1_part']] = df[['sample_part', 'n0_part', 'n1_part']].round(self.feature_woe.round_woe)
+            dfs.append(df)
+            dfs.append(pd.DataFrame({'feature': feature, 'categorical_type': categorical_type, 'group': 'others', 'values': 'all others', 'woe': self.feature_woe.others_woe, 'missing': 0}, index=[0]))
+        if dfs:
+            scorecard = pd.concat(dfs).reset_index(drop=True)
+        else:
+            scorecard = pd.DataFrame()
+        return scorecard
+
+    def import_scorecard(self, scorecard, verbose=True, fit_flag=False):
+        '''
+        Sets self.groups, self.categorical_type and self.missing_group values from dataframe and calculates woe (by fit).
+
+        Parameters
+        ----------
+        scorecard: a DataFrame with 'categorical_type', 'group', 'values' and 'missing' fields
+        verbose: should bins and woes be printed or not
+        fit_flag: should woes be calculated or taken from input dataframe
+        '''
+        for f2, scorecard_f2 in scorecard.groupby('f2'):
+            if scorecard_f2[scorecard_f2['group1'] != 'others'].empty:
+                continue
+            for group, scorecard_f2_group in scorecard_f2.groupby('group1'):
+                if group != 'others':
+                    self.cross[f2][group].import_scorecard(scorecard=scorecard_f2_group[['f2', 'categorical_type2', 'group2', 'values2', 'woe', 'missing2']]\
+                                            .set_axis(['feature', 'categorical_type', 'group', 'values', 'woe', 'missing'], axis=1),
+                                            verbose=False, fit_flag=False)
+
+                else:
+                    self.feature_woe.others_woe = scorecard_f2_group['woe'].values[0]
+            if fit_flag:
+                self.calc_simple_woes(f2)
+            if verbose:
+                self.print_woe(f2)
+
+    def get_woes(self, f2):
+        return {str([g, g2]): woe for g, fw in self.cross[f2].items() for g2, woe in fw.woes.items()}
+
+    def get_values(self, f2):
+        return {str([g, g2]): value for g, fw in self.cross[f2].items() for g2, value in fw.groups.items()}
+
+    def get_2values(self, f2):
+        return {str([g, g2]): str(self.feature_woe.groups[g]) + ' & ' + str(value) for g, fw in self.cross[f2].items() for g2, value in fw.groups.items()}

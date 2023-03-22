@@ -5,7 +5,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import io
-
+import os
 
 def fig_to_excel(fig, ws, row=0, col=0, scale=1):
     if fig is not None:
@@ -30,6 +30,24 @@ def rem_suffix(f):
     if f.endswith('_WOE'):
         return f[:-4]
     return f
+
+
+def is_cross(f):
+    return f.startswith('cross_') and '&' in f
+
+
+def cross_name(f1, f2):
+    return f'cross_{f1}&{f2}'
+
+
+def cross_split(f):
+    return f[6:].split('&') if is_cross(f) else [f, '']
+
+
+def add_ds_folder(ds, file_name):
+    if ds is None or not os.path.exists(ds.result_folder + os.path.dirname(file_name)):
+        return file_name
+    return ds.result_folder + file_name
 
 
 def color_digits(x, threshold_red, threshold_yellow=None):

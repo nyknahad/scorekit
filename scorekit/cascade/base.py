@@ -3,7 +3,6 @@
 from ..data import DataSamples
 from ..model import LogisticRegressionModel, NpEncoder
 import pandas as pd
-import numpy as np
 import cloudpickle
 import base64
 import inspect

@@ -11,12 +11,13 @@ import warnings
 import os
 import gc
 import copy
-from .._utils import color_background, fig_to_excel, adjust_cell_width
+from .._utils import color_background, fig_to_excel, adjust_cell_width, add_suffix, rem_suffix, cross_split, is_cross
 from patsy import dmatrices
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from textwrap import wrap
 from concurrent import futures
 from functools import partial
+from scipy.stats import chi2, chisquare, ks_2samp, ttest_ind, kstest
 
 warnings.simplefilter('ignore')
 plt.rc('font', family='Verdana', size=12)
@@ -31,7 +32,7 @@ class DataSamples:
     """
     def __init__(self, samples=None, target=None, features=None, cat_columns=None, min_nunique=20, time_column=None,
                  id_column=None, feature_descriptions=None, train_name=None, special_bins=None, result_folder='',
-                 n_jobs=1, random_state=0):
+                 n_jobs=1, random_state=0, samples_split=None, bootstrap_split=None):
         """
         :param samples: выборка для разработки. Задается в виде словаря {название_сэмпла: датафрейм}, может содержать любое кол-во сэмплов
         :param target: целевая переменная
@@ -46,6 +47,8 @@ class DataSamples:
         :param result_folder: папка, в которую будут сохраняться все результаты работы с этим ДатаСэмплом
         :param n_jobs: кол-во используемых рабочих процессов, при -1 берется число, равное CPU_LIMIT
         :param random_state: сид для генератора случайных чисел, используется во всех остальных методах, где необходимо
+        :param samples_split: словарь с параметрами для вызова метода self.samples_split
+        :param bootstrap_split: словарь с параметрами для вызова метода self.bootstrap_split
         """
         if isinstance(result_folder, str):
             if result_folder and not os.path.exists(result_folder):
@@ -66,7 +69,7 @@ class DataSamples:
         if feature_descriptions is not None:
             self.feature_descriptions = self.feature_descriptions[~self.feature_descriptions.index.duplicated(keep='first')]
         self.feature_titles = {index: index + '\n\n' +
-                                      '\n'.join(['\n'.join(wrap(l, 75)) for l in row.astype('str').values.flatten().tolist() if not pd.isnull(l) and l != 'nan'])
+           '\n'.join(['\n'.join(wrap(l, 75)) for l in row.astype('str').values.flatten().tolist() if not pd.isnull(l) and l != 'nan'])
                                for index, row in self.feature_descriptions.iterrows()} if self.feature_descriptions is not None else {}
         self.time_column = time_column if time_column and self.samples and time_column in self.samples[self.train_name] else None
 
@@ -107,25 +110,114 @@ class DataSamples:
                     self.samples[name][f_inf] = self.samples[name][f_inf].replace([np.inf, -np.inf], special_value)
                 print(f"Warning! Features {f_inf} contain infinities. They are replaced by {special_value} and special bin {{'Infinity': {special_value}}} is added.")
 
-        try:
-            n_jobs_max = int(float(os.environ.get('CPU_LIMIT')))
-        except:
-            n_jobs_max = 4
-        if n_jobs > n_jobs_max:
-            print(f'Warning! N_jobs exceeds CPU_LIMIT. Set to {n_jobs_max}')
-            self.n_jobs = n_jobs_max
-        elif n_jobs == -1:
-            self.n_jobs = n_jobs_max
-        else:
-            self.n_jobs = n_jobs
+        if n_jobs != 1:
+            try:
+                n_jobs_max = int(float(os.environ.get('CPU_LIMIT')))
+            except:
+                n_jobs_max = os.cpu_count()
+            if n_jobs > n_jobs_max:
+                print(f'Warning! N_jobs exceeds CPU_LIMIT. Set to {n_jobs_max}')
+                n_jobs = n_jobs_max
+            elif n_jobs < 1:
+                n_jobs = n_jobs_max
+        self.n_jobs = n_jobs
         self.random_state = random_state
         self.max_queue = self.n_jobs*2
         self.n_jobs_restr = 1
-        self.bootstrap_base = None
+        if samples_split is not None and isinstance(samples_split, dict):
+            self.samples_split(**samples_split)
+        if bootstrap_split is not None and isinstance(bootstrap_split, dict):
+            self.bootstrap_split(**bootstrap_split)
+        else:
+            self.bootstrap_base = None
+            self.bootstrap = []
+
+    def samples_split(self, df=None, test_size=0.3, validate_size=0, split_type='oos', stratify=True, id_column=None):
+        """
+        Разбивка датафрейма на сэмплы
+        :param df: датафрейм из которого нарезаются сэмплы. При None берется self.samples[self.train_name]
+        :param test_size: размер сэмпла test
+        :param validate_size: размер сэмпла validate
+        :param split_type: тип разбиения 'oos' = 'out-of-sample', 'oot' = 'out-of-time'
+        :param stratify: стратификация по целевой переменной. Только для split_type='oos'
+        :param id_column: название поля с айди. Если задано, то все одинаковые айди распределяются в один сэмпл,
+                          в случае split_type='oot' из теста исключаются айди, присутсвующие в трэйне. Размер теста при этом может стать сильно меньше test_size
+        """
+        if df is None:
+            df = self.samples[self.train_name].copy()
+        else:
+            self.train_name = 'Train'
+        if split_type == 'oos':
+            for_split = df[self.target] if id_column is None else df.groupby(by=id_column)[self.target].max()
+            split = {}
+            split[self.train_name], split['Test'] = train_test_split(for_split, test_size=test_size, random_state=self.random_state, stratify=for_split if stratify else None)
+            if validate_size > 0:
+                split[self.train_name], split['Validate'] = train_test_split(split[self.train_name], test_size=validate_size/(1 - test_size), random_state=self.random_state, stratify=split[self.train_name] if stratify else None)
+
+            if id_column is not None:
+                self.samples = {}
+                dr = df[self.target].mean()
+                for name, sp in split.items():
+                    tmp = df[df[id_column].isin(sp.index)]
+                    if stratify:
+                        dr_tmp = tmp[self.target].mean()
+                        if dr_tmp > dr:
+                            g = tmp[tmp[self.target] == 0]
+                            tmp = pd.concat([g, tmp[tmp[self.target] == 1].sample(n=round(len(g) * dr / (1 - dr)), random_state=self.random_state)])
+                        else:
+                            b = tmp[tmp[self.target] == 1]
+                            tmp = pd.concat([tmp[tmp[self.target] == 0].sample(n=round(len(b) * (1 - dr) / dr), random_state=self.random_state), b])
+                    self.samples[name] = tmp
+            else:
+                self.samples = {name: df.loc[list(sp.index)] for name, sp in split.items()}
+
+        elif split_type == 'oot':
+            if self.time_column is None:
+                print ('Wich column contains time data? Please pay attention to time_column parameter.')
+                return None
+            if validate_size > 0:
+                print ('Validation for oot is unavailable.')
+            else:
+                tmp_dataset = copy.deepcopy(df).sort_values(by=self.time_column)
+                test_threshold = list(tmp_dataset[self.time_column].drop_duplicates())[int(round((1 - test_size)*len(tmp_dataset[self.time_column].drop_duplicates()), 0))]
+                self.samples = {self.train_name: tmp_dataset[tmp_dataset[self.time_column] < test_threshold],
+                                'Test': tmp_dataset[tmp_dataset[self.time_column] >= test_threshold]}
+                if id_column is not None:
+                    self.samples['Test'] = self.samples['Test'][~self.samples['Test'][id_column].isin(self.samples[self.train_name][id_column])]
+        else:
+            print ('Wrong split type. Please use oot or oos.')
+            return None
+
+        print('Actual parts of samples:')
+        for name, sample in self.samples.items():
+            print(f'{name}: {round(sample.shape[0]/df.shape[0], 4)}')
+
+    def bootstrap_split(self, df, bootstrap_part=1, bootstrap_number=100, stratify=True, replace=True):
+        """
+        Создание подвыборок для бутстрэпа
+        :param df: датафрейм, основа для нарезания подвыборок
+        :param bootstrap_part: размер каждой подвыборки
+        :param bootstrap_number: кол-во подвыборок
+        :param stratify: стратификация каждой подвыборки по целевой переменной
+        :param replace: разрешается ли повторять каждое наблюдение множество раз в подвыборке
+        """
+        self.bootstrap_base = df
+        if 'Infinity' in self.special_bins:
+            self.bootstrap_base[self.features] = self.bootstrap_base[self.features].replace([np.inf, -np.inf], self.special_bins['Infinity'])
         self.bootstrap = []
-        self.ginis = {}
-        self.ginis_in_time = {}
-        self.gini_df = None
+        if stratify:
+            class0 = self.bootstrap_base[self.bootstrap_base[self.target] == 0]
+            class1 = self.bootstrap_base[self.bootstrap_base[self.target] == 1]
+
+        for bi in range(bootstrap_number):
+            if stratify:
+                index_1 = class1.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index
+                index_0 = class0.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index
+                bootstrap_current = [self.bootstrap_base.index.get_loc(idx) for idx in index_1.append(index_0)]
+            else:
+                bootstrap_current = [self.bootstrap_base.index.get_loc(idx)
+                                     for idx in self.bootstrap_base.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index]
+            self.bootstrap.append(bootstrap_current)
 
     def to_df(self, sample_field='sample'):
         """
@@ -134,13 +226,7 @@ class DataSamples:
 
         :return: датафрейм
         """
-        dfs = []
-        for name, sample in self.samples.items():
-            df = sample.copy()
-            if sample_field:
-                df[sample_field] = name
-            dfs.append(df)
-        return pd.concat(dfs)
+        return pd.concat([sample.copy().assign(**{sample_field: name}) if sample_field else sample for name, sample in self.samples.items()])
 
     def stats(self, out=None, gini_in_time=True, targettrend=None):
         """
@@ -175,7 +261,7 @@ class DataSamples:
                 f_stats.columns = pd.MultiIndex.from_product([list(self.samples.keys()), tmp.columns])
                 f_stats.to_excel(writer, sheet_name='Feature stats')
                 gini_df = self.calc_gini(fillna=-999999999, add_description=True)
-                self.corr_mat().to_excel(writer, sheet_name='Correlation')
+                self.corr_mat(description_df=gini_df).to_excel(writer, sheet_name='Correlation')
                 adjust_cell_width(writer.sheets['Correlation'], gini_df)
                 gini_df.to_excel(writer, sheet_name='Gini stats')
                 adjust_cell_width(writer.sheets['Gini stats'], gini_df)
@@ -189,41 +275,40 @@ class DataSamples:
         print(stats.to_string())
 
     @staticmethod
-    def get_f_gini(df, fillna=None):
+    def get_f_gini(y, f, fillna=None):
         if fillna is not None:
-            df = df.copy().fillna(fillna)
+            f = f.copy().fillna(fillna)
         try:
-            return (2 * roc_auc_score(df.iloc[:, 0], -df.iloc[:, 1]) - 1) * 100
+            return (2 * roc_auc_score(y, -f) - 1) * 100
         except:
             return 0
 
     @staticmethod
-    def get_features_gini(df, fillna=None):
-        return {f: DataSamples.get_f_gini(df[[df.columns[0], f]], fillna=fillna) for f in list(df.columns[1:])}
+    def get_features_gini(y, df, fillna=None):
+        return {f: DataSamples.get_f_gini(y, df[f], fillna=fillna) for f in df}
 
     @staticmethod
-    def get_time_features_gini(df, time_column, fillna=None):
-        return {time: DataSamples.get_features_gini(group.drop([time_column], axis=1), fillna=fillna) for time, group in df.groupby(time_column)}
+    def get_time_features_gini(df, target, time_column, fillna=None):
+        return {time: DataSamples.get_features_gini(group[target], group.drop([target, time_column], axis=1), fillna=fillna) for time, group in df.groupby(time_column)}
 
-    def calc_gini(self, features=None, fillna=None, add_description=False, abs=False, mode=0):
+    def calc_gini(self, features=None, fillna=None, add_description=False, abs=False, samples=None):
         """
-        Вычисление джини всех переменных, словарь вида {название_сэмпла: {переменная: джини}} сохраняется в self.ginis
+        Вычисление джини всех переменных
         :param features: список переменных для расчета. При None берется self.features
         :param fillna: значение для заполнения пропусков. При None пропуски не заполняются
         :param add_description: флаг для добавления в датафрейм описания перемнных из self.feature_descriptions
         :param abs: возвращать абсолютные значения джини
-        :param mode: 0 - расчет джини на всех основных и бутсрэп сэмплах
-                     1 - расчет джини только на всех основных сэмплах
-                    -1 - расчет джини только на бутсрэп сэмплах
+        :param samples: список названий сэмплов для расчета. При None вычисляется на всех доступных сэмпплах
 
         :return: датафрейм с джини
         """
         if features is None:
             features = self.features
-        if mode >= 0:
-            self.ginis = {name: self.get_features_gini(sample[[self.target] + [f for f in features if f in sample.columns]], fillna=fillna)
-                          for name, sample in self.samples.items()}
-        if self.bootstrap_base is not None and mode <= 0:
+        if samples is None:
+            samples = list(self.samples) + ['Bootstrap']
+        ginis = {name: self.get_features_gini(sample[self.target], sample[[f for f in features if f in sample]], fillna=fillna)
+                 for name, sample in self.samples.items() if name in samples}
+        if self.bootstrap_base is not None and 'Bootstrap' in samples:
             bts_features = [f for f in features if f in self.bootstrap_base.columns]
             if bts_features:
                 if self.n_jobs_restr > 1:
@@ -234,7 +319,8 @@ class DataSamples:
                         idx_iter = iter(self.bootstrap)
                         while iterations:
                             for idx in idx_iter:
-                                jobs.append(pool.submit(self.get_features_gini, df=self.bootstrap_base.iloc[idx][[self.target] + bts_features], fillna=fillna))
+                                jobs.append(pool.submit(self.get_features_gini, y=self.bootstrap_base.iloc[idx][self.target],
+                                                        df=self.bootstrap_base.iloc[idx][bts_features], fillna=fillna))
                                 if len(jobs) > self.max_queue:
                                     break
                             for job in futures.as_completed(jobs):
@@ -244,27 +330,27 @@ class DataSamples:
                                 break
                     gc.collect()
                 else:
-                    ginis_bootstrap = [self.get_features_gini(self.bootstrap_base.iloc[idx][[self.target] + bts_features], fillna=fillna)
+                    ginis_bootstrap = [self.get_features_gini(self.bootstrap_base.iloc[idx][self.target], self.bootstrap_base.iloc[idx][bts_features], fillna=fillna)
                                        for idx in self.bootstrap]
 
-                self.ginis['Bootstrap mean'] = {f: np.mean([ginis[f] for ginis in ginis_bootstrap]) for f in bts_features}
-                self.ginis['Bootstrap std'] = {f: np.std([ginis[f] for ginis in ginis_bootstrap]) for f in bts_features}
-        result = pd.DataFrame(self.ginis).round(2)
+                ginis['Bootstrap mean'] = {f: np.mean([ginis[f] for ginis in ginis_bootstrap]) for f in bts_features}
+                ginis['Bootstrap std'] = {f: np.std([ginis[f] for ginis in ginis_bootstrap]) for f in bts_features}
+        result = pd.DataFrame(ginis).round(2)
         if abs:
             result = result.abs()
         if add_description:
             try:
+                self.add_cross_description(features)
                 tmp = self.feature_descriptions.copy()
                 tmp.index += '_WOE'
                 result = pd.concat([self.feature_descriptions, tmp]).merge(result, left_index=True, right_index=True, how='right')
             except:
                 pass
-        self.gini_df = result
         return result
 
     def calc_gini_in_time(self, features=None, fillna=None, ds_aux=None, abs=False):
         """
-        Вычисление динамики джини по срезам для всех переменных, словарь вида {название_сэмпла: {переменная: {срез: джини}}} сохраняется в self.ginis_in_time.
+        Вычисление динамики джини по срезам для всех переменных
         Доступно только если задано значение self.time_column
         :param features: писок переменных для расчета. При None берется self.features
         :param fillna: значение для заполнения пропусков. При None пропуски не заполняются
@@ -286,8 +372,8 @@ class DataSamples:
 
         if features is None:
             features = self.features
-        self.ginis_in_time = {name: self.get_time_features_gini(sample[[self.target, time_column] + [f for f in features if f in sample.columns]],
-                                                                time_column=time_column, fillna=fillna)
+        ginis_in_time = {name: self.get_time_features_gini(sample[[self.target, time_column] + [f for f in features if f in sample.columns]],
+                                                           target=self.target, time_column=time_column, fillna=fillna)
                               for name, sample in samples.items()}
 
         if self.bootstrap_base is not None:
@@ -308,7 +394,7 @@ class DataSamples:
                             for idx in idx_iter:
                                 jobs.append(pool.submit(self.get_time_features_gini,
                                                         df=bootstrap_base.iloc[idx][[self.target, time_column] + [f for f in bts_features]],
-                                                        time_column=time_column, fillna=fillna))
+                                                        target=self.target, time_column=time_column, fillna=fillna))
                                 if len(jobs) > self.max_queue:
                                     break
                             for job in futures.as_completed(jobs):
@@ -320,55 +406,57 @@ class DataSamples:
                     gc.collect()
                 else:
                     ginis_bootstrap = [self.get_time_features_gini(bootstrap_base.iloc[idx][[self.target, time_column] + bts_features],
-                                                                   time_column=time_column, fillna=fillna)
+                                                                   target=self.target, time_column=time_column, fillna=fillna)
                                        for idx in self.bootstrap]
                 time_values = sorted(bootstrap_base[time_column].unique())
-                self.ginis_in_time['Bootstrap mean'] = {time: {f: np.mean([ginis[time][f] for ginis in ginis_bootstrap if time in ginis])
+                ginis_in_time['Bootstrap mean'] = {time: {f: np.mean([ginis[time][f] for ginis in ginis_bootstrap if time in ginis])
                                                                for f in bts_features}
                                                         for time in time_values}
-                self.ginis_in_time['Bootstrap std'] = {time: {f: np.std([ginis[time][f] for ginis in ginis_bootstrap if time in ginis])
+                ginis_in_time['Bootstrap std'] = {time: {f: np.std([ginis[time][f] for ginis in ginis_bootstrap if time in ginis])
                                                               for f in bts_features}
                                                        for time in time_values}
 
-        time_values = sorted(list({time for name in self.ginis_in_time for time in self.ginis_in_time[name]}))
-        result = pd.DataFrame([[time] + [self.ginis_in_time[name][time][f] if time in self.ginis_in_time[name] and f in self.ginis_in_time[name][time] else 0
-                                         for f in features for name in self.ginis_in_time]
+        time_values = sorted(list({time for name in ginis_in_time for time in ginis_in_time[name]}))
+        result = pd.DataFrame([[time] + [ginis_in_time[name][time][f] if time in ginis_in_time[name] and f in ginis_in_time[name][time] else 0
+                                         for f in features for name in ginis_in_time]
                                for time in time_values],
-                            columns=[time_column] + [f'Gini {name} {f}' for f in features for name in self.ginis_in_time]).set_index(time_column).round(2)
-        result.columns = pd.MultiIndex.from_product([features, list(self.ginis_in_time.keys())])
+                            columns=[time_column] + [f'Gini {name} {f}' for f in features for name in ginis_in_time]).set_index(time_column).round(2)
+        result.columns = pd.MultiIndex.from_product([features, list(ginis_in_time.keys())])
         if abs:
             result = result.abs()
         return result
 
-    def corr_mat(self, sample_name=None, features=None, corr_method='pearson', corr_threshold=0.75):
+    def corr_mat(self, sample_name=None, features=None, corr_method='pearson', corr_threshold=0.75, description_df=None, styler=True):
         """
         Вычисление матрицы корреляций
         :param sample_name: название сэмпла, из которого берутся данные. По умолчанию self.train_name
         :param features: список переменных для расчета. По умолчанию берутся из self.features
         :param corr_method: метод расчета корреляций. Доступны варианты 'pearson', 'kendall', 'spearman'
         :param corr_threshold: трэшхолд значения корреляции. Используется для выделения значений цветом
+        :param description_df: Датафрейм с описанием переменных. Будет приджойнем к матрице корреляций по индексу
+        :param styler: При True возвращается датафрейм styler, иначе датафрейм
 
-        :return: датафрейм с матрицей корреляций
+        :return: датафрейм styler либо датафрейм
         """
         if features is None:
             features = self.features
         if sample_name is None:
             sample_name = self.train_name
-        corr_df = self.samples[sample_name][features].corr(method=corr_method)
-        if self.gini_df is None:
-            gini_df = corr_df
+        features = [f for f in features if pd.api.types.is_numeric_dtype(self.samples[self.train_name][f])]
+        corr_df = self.samples[sample_name][features].corr(method=corr_method).rename({f: i for i, f in enumerate(features, start=1)}, axis=1)
+        if description_df is not None:
+            corr_df = description_df.merge(corr_df, left_index=True, right_index=True, how='right')
+        corr_df.index = corr_df.index.map({f: f'{f} ({i})' for i, f in enumerate(features, start=1)})
+        if styler:
+            return corr_df.round(2).style.applymap(lambda x: 'color: black' if isinstance(x, str) or x > 1 or x < -1 else 'color: red'
+                                                                            if abs(x) > corr_threshold else 'color: orange'
+                                                                            if abs(x) > corr_threshold ** 2 else 'color: green',
+                                                   subset=pd.IndexSlice[:, list(range(1, len(features) + 1))])
         else:
-            gini_df = self.gini_df.merge(corr_df, left_index=True, right_index=True, how='right')
-        nums = list(range(1, len(corr_df.columns) + 1))
-        gini_df.columns = [f for f in gini_df.columns if f not in corr_df.columns] + nums
-        gini_df.index = ['%s (%d)' % (x, i + 1) for i, x in enumerate(gini_df.index)]
-        return gini_df.round(2).style.applymap(
-                lambda x: 'color: black' if isinstance(x, str) or x > 1 or x < -1 else 'color: red'
-                if abs(x) > corr_threshold else 'color: orange'
-                if abs(x) > corr_threshold ** 2 else 'color: green', subset=pd.IndexSlice[:, nums])
+            return corr_df.round(2)
 
     def psi(self, time_column=None, sample_name=None, features=None, normalized=True, yellow_zone=0.1, red_zone=0.25,
-            base_period_index=0, n_bins=5, legend_map=None):
+            base_period_index=0, n_bins=5, scorecard=None):
         """
         Вычисление Population Stability Index
         StabilityIndex[t] = (N[i, t]/sum_i(N[i, t]) - (N[i, 0]/sum_i(N[i, 0])))* log(N[i, t]/sum_i(N[i, t])/(N[i, 0]/sum_i(N[i, 0])))
@@ -381,8 +469,9 @@ class DataSamples:
         :param yellow_zone: нижняя граница желтой зоны значения PSI
         :param red_zone: нижняя граница красерй зоны значения PSI
         :param base_period_index: индекс основного среза в отсортированном списке значений срезов, относительного которого считается PSI остальных срезов
+                                    при - 1 тест для каждого среза считается относительно предыдущего
         :param n_bins: кол-во бинов на которые будут разбиты значения переменных, если кол-во уникальных значений > 20
-        :param legend_map: словарь мэппинга легенды вида {переменная: {исходное значение: новое значение}}. Используется для добавления описания значений WOE в легенде графика PSI
+        :param scorecard: датафрейм со скоркартой. Используется для добавления описания значений WOE в легенде графика PSI
 
         :return: кортеж (Датафрейм,  список из графиков PSI [plt.figure])
         """
@@ -398,6 +487,12 @@ class DataSamples:
         if features is None:
             features = self.features
 
+        if scorecard is not None:
+            scorecard['woe_map'] = scorecard['woe'].astype('str')
+            scorecard['values_map'] = scorecard['values'].astype('str') + '. WOE ' + scorecard['woe_map']
+            legend_map = {add_suffix(f): f_df.set_index('woe_map')['values_map'].to_dict() for f, f_df in scorecard.groupby('feature')}
+        else:
+            legend_map = None
         tmp_dataset = self.samples[sample_name][features + [time_column, self.target]].copy()
         for c, feature in enumerate(features):
             if tmp_dataset[feature].nunique() > 20:
@@ -423,13 +518,16 @@ class DataSamples:
         stability2 = stability1[['feature', 'value']].copy()
         for date in dates:
             stability2[date] = list(stability1[date] / list(stability1.drop(['value'], 1).groupby(by='feature').sum()[date][:1])[0])
-        start_date = dates[base_period_index]
+
         stability3 = stability2[['feature', 'value']]
-        for date in dates:
-            stability3[date] = round(((stability2[date] - stability2[start_date]) * np.log(
-                stability2[date] / stability2[start_date])).replace([+np.inf, -np.inf], 0).fillna(0), 2)
+        for i, date in enumerate(dates):
+            if base_period_index == -1:
+                start_date = dates[i - 1 if i > 0 else 0]
+            else:
+                start_date = dates[base_period_index]
+            stability3[date] = round(((stability2[date] - stability2[start_date]) * np.log(stability2[date] / stability2[start_date])).replace([+np.inf, -np.inf], 0).fillna(0), 2)
         stability4 = stability3.drop(['value'], 1).groupby(by='feature').sum()
-        result = stability4.reindex(index=all_stats['feature'].drop_duplicates()).style.apply(color_background, mn=0, mx=red_zone, cntr=yellow_zone)
+        result = stability4.reindex(index=all_stats['feature'].drop_duplicates()).style.applymap(lambda x: 'color: red' if x > red_zone else 'color: orange' if x > yellow_zone / 5 else 'color: green')
 
         date_base = pd.DataFrame(all_stats[time_column].unique(), columns=[time_column]).sort_values(time_column)
         for num_f, feature in enumerate(features):
@@ -648,141 +746,55 @@ class DataSamples:
         plt.close('all')
         return figs
 
-    def samples_split(self, df=None, test_size=0.3, validate_size=0, split_type='oos', stratify=True, id_column=None):
-        """
-        Разбивка датафрейма на сэмплы
-        :param df: датафрейм из которого нарезаются сэмплы. При None берется self.samples[self.train_name]
-        :param test_size: размер сэмпла test
-        :param validate_size: размер сэмпла validate
-        :param split_type: тип разбиения 'oos' = 'out-of-sample', 'oot' = 'out-of-time'
-        :param stratify: стратификация по целевой переменной. Только для split_type='oos'
-        :param id_column: название поля с айди. Если задано, то все одинаковые айди распределяются в один сэмпл,
-                          в случае split_type='oot' из теста исключаются айди, присутсвующие в трэйне. Размер теста при этом может стать сильно меньше test_size
-        """
-        if df is None:
-            df = self.samples[self.train_name].copy()
-        else:
-            self.train_name = 'Train'
-        if split_type == 'oos':
-            for_split = df[self.target] if id_column is None else df.groupby(by=id_column)[self.target].max()
-            split = train_test_split(for_split, test_size=test_size, random_state=self.random_state, stratify=for_split if stratify else None)
-            if validate_size > 0:
-                split[0], validate = train_test_split(split[0], test_size=validate_size/(1 - test_size), random_state=self.random_state, stratify=split[0] if stratify else None)
-                split.append(validate)
-
-            if id_column is not None:
-                dfs = []
-                dr = df[self.target].mean()
-                for sp in split:
-                    tmp = df[df[id_column].isin(sp.index)]
-                    dr_tmp = tmp[self.target].mean()
-                    if dr_tmp > dr:
-                        g = tmp[tmp[self.target] == 0]
-                        tmp = pd.concat([g, tmp[tmp[self.target] == 1].sample(n=round(len(g) * dr / (1 - dr)), random_state=self.random_state)])
-                    else:
-                        b = tmp[tmp[self.target] == 1]
-                        tmp = pd.concat([tmp[tmp[self.target] == 0].sample(n=round(len(b) * (1 - dr) / dr), random_state=self.random_state), b])
-                    dfs.append(tmp)
-            else:
-                dfs = [df.loc[list(sp.index)] for sp in split]
-
-        elif split_type == 'oot':
-            if self.time_column is None:
-                print ('Wich column contains time data? Please pay attention to time_column parameter.')
-                return None
-            if validate_size > 0:
-                print ('Validation for oot is unavailable.')
-            else:
-                tmp_dataset = copy.deepcopy(df).sort_values(by=self.time_column)
-                test_threshold = list(tmp_dataset[self.time_column].drop_duplicates())[int(round((1 - test_size)*len(tmp_dataset[self.time_column].drop_duplicates()), 0))]
-                dfs = [tmp_dataset[tmp_dataset[self.time_column] < test_threshold],
-                       tmp_dataset[tmp_dataset[self.time_column] >= test_threshold]]
-                if id_column is not None:
-                    dfs[1] = dfs[1][~dfs[1][id_column].isin(dfs[0][id_column])]
-        else:
-            print ('Wrong split type. Please use oot or oos.')
-            return None
-
-        sample_names = [self.train_name, 'Test', 'Validate']
-        self.samples = {sample_names[i]: df1 for i, df1 in enumerate(dfs)}
-        print('Actual parts of samples:')
-        for name, sample in self.samples.items():
-            print(f'{name}: {round(sample.shape[0]/df.shape[0], 4)}')
-
-    def bootstrap_split(self, df, bootstrap_part=0.75, bootstrap_number=10, stratify=True, replace=True):
-        """
-        Создание подвыборок для бутстрэпа
-        :param df: датафрейм, основа для нарезания подвыборок
-        :param bootstrap_part: размер каждой подвыборки
-        :param bootstrap_number: кол-во подвыборок
-        :param stratify: стратификация каждой подвыборки по целевой переменной
-        :param replace: разрешается ли повторять каждое наблюдение множество раз в подвыборке
-        """
-        self.bootstrap_base = df
-        if 'Infinity' in self.special_bins:
-            self.bootstrap_base[self.features] = self.bootstrap_base[self.features].replace([np.inf, -np.inf], self.special_bins['Infinity'])
-        self.bootstrap = []
-        if stratify:
-            class0 = self.bootstrap_base[self.bootstrap_base[self.target] == 0]
-            class1 = self.bootstrap_base[self.bootstrap_base[self.target] == 1]
-
-        for bi in range(bootstrap_number):
-            if stratify:
-                index_1 = class1.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index
-                index_0 = class0.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index
-                bootstrap_current = [self.bootstrap_base.index.get_loc(idx) for idx in index_1.append(index_0)]
-            else:
-                bootstrap_current = [self.bootstrap_base.index.get_loc(idx)
-                                     for idx in self.bootstrap_base.sample(frac=bootstrap_part, replace=replace, random_state=self.random_state+bi).index]
-            self.bootstrap.append(bootstrap_current)
-
-    def CorrelationAnalyzer(self, sample_name=None, features=None, hold=None, method='pearson', threshold=0.6,
-                             drop_with_most_correlations=True, verbose=False):
+    def CorrelationAnalyzer(self, sample_name=None, features=None, hold=None, scores=None, method='pearson',
+                            threshold=0.6, drop_with_most_correlations=True, verbose=False):
         """
         Корреляционный анализ переменных на выборке, формирование словаря переменных с причиной для исключения
         :param sample_name: название сэмпла на котором проводится отбор. При None берется ds.train_sample
         :param features: исходный список переменных для анализа. При None берется self.features
-        :param hold: список переменных, которые обязательно должны войти в модель
+        :param hold: список/сет переменных, которые не будут исключаться при корреляционном анализе
+        :param scores: словарь с метриками переменных вида {переменна: метрики}, которые будут использоваться при исключении переменных.
+                      При None рассчитываются однофакторные джини
         :param method: метод расчета корреляций. Доступны варианты 'pearson', 'kendall', 'spearman'
         :param threshold: граница по коэффициенту корреляции
         :param drop_with_most_correlations:  при True - итерационно исключается фактор с наибольшим кол-вом коррелирующих с ним факторов с корреляцией выше threshold
-                                             при False - итерационно исключается фактор с наименьшим джини из списка коррелирующих факторов
-        :param verbose: флаг для вывода подробных комментариев в процессе работы
+                                             при False - итерационно исключается фактор с наименьшим значением метрики из списка коррелирующих факторов
+        :param verbose: флаг для вывода списка исключенных переменных
 
         :return: словарь переменных для исключения вида {переменная: причина исключения}
         """
-        if hold is None:
-            hold = []
-
         if sample_name is None:
-            sample_name = self.train_name        
-
-        if not self.ginis or not self.ginis[sample_name]:
-            self.calc_gini()
-
+            sample_name = self.train_name
         if features is None:
             features = self.features
-
+        if hold is None:
+            hold = set()
+        if scores is None:
+            scores = self.calc_gini(features=features, samples=[sample_name])[sample_name].to_dict()
         correlations = self.samples[sample_name][features].corr(method=method).abs()
         to_check_correlation=True
         features_to_drop = {}
         while to_check_correlation:
             to_check_correlation=False
             corr_number = {}
-            significantly_correlated={}
+            significantly_correlated = {}
             for var in correlations:
                 var_corr = correlations[var]
                 var_corr = var_corr[(var_corr.index != var) & (var_corr > threshold)].sort_values(ascending=False).copy()
                 corr_number[var] = var_corr.shape[0]
                 significantly_correlated[var] = str(var_corr.index.tolist())
             if drop_with_most_correlations:
-                with_correlation = {x: self.ginis[sample_name][x] for x in corr_number
-                                    if corr_number[x] == max([corr_number[x] for x in corr_number if x not in hold])
-                                    and corr_number[x] > 0 and x not in hold}
+                corr_number_not_in_hold = [corr_number[x] for x in corr_number if x not in hold]
+                if corr_number_not_in_hold:
+                    with_correlation = {x: scores[x] for x in corr_number
+                                        if corr_number[x] == max(corr_number_not_in_hold)
+                                        and corr_number[x] > 0 and x not in hold}
+                else:
+                    with_correlation = {}
             else:
-                with_correlation = {x: self.ginis[sample_name][x] for x in corr_number if corr_number[x] > 0 and x not in hold}
-            if len(with_correlation)>0:
-                feature_to_drop=min(with_correlation, key=with_correlation.get)
+                with_correlation = {x: scores[x] for x in corr_number if corr_number[x] > 0 and x not in hold}
+            if with_correlation:
+                feature_to_drop = min(with_correlation, key=with_correlation.get)
                 features_to_drop[feature_to_drop] = f'High correlation with features: {significantly_correlated[feature_to_drop]}'
                 correlations = correlations.drop(feature_to_drop, axis=1).drop(feature_to_drop, axis=0).copy()
                 to_check_correlation = True
@@ -813,4 +825,76 @@ class DataSamples:
                            data=self.samples[sample_name], return_type="dataframe")
 
         # For each Xi, calculate VIF
-        return pd.DataFrame({features[i - 1]: variance_inflation_factor(X_.values, i) for i in range(1, X_.shape[1])}, index=[0]).T
+        return pd.DataFrame.from_dict({features[i - 1]: variance_inflation_factor(X_.values, i) for i in range(1, X_.shape[1])}, orient='index', columns=[sample_name])
+
+    def KS_test(self, sample_name=None, features=None):
+        """
+        Рассчет коэффициента Колмогорова-Смирнова для списка переменных
+        :param sample_name: название сэмпла на котором проводится расчет. При None берется ds.train_sample
+        :param features: список переменных для анализа. При None берется self.features
+
+        :return: ДатаФрейм с индексом из списка переменных и полем с расчитанным коэффициентом KS
+        """
+        if sample_name is None:
+            sample_name = self.train_name
+
+        if features is None:
+            features = self.features
+        df = self.samples[sample_name]
+        return pd.DataFrame.from_dict({f: kstest(df[df[self.target] == 0][f], df[df[self.target] == 1][f]).statistic for f in features}, orient='index', columns=[sample_name])
+
+    def IV_test(self, sample_name=None, features=None):
+        """
+        Рассчет IV для списка переменных
+        :param sample_name: название сэмпла на котором проводится расчет. При None берется ds.train_sample
+        :param features: список переменных для анализа. При None берется self.features
+
+        :return: ДатаФрейм с индексом из списка переменных и полем с расчитанным IV
+        """
+        def iv_bin(d):
+            """
+            Вычисляет метрику Information Value
+            -----------------------------------
+            Вход
+            d: датафрейм из 2-х столбцов: первый - переменная, второй - флаг дефолта.
+            Ограничение - второе распределение - бинарное [0,1]
+            :returns значение метрики IV, ?
+            """
+            df1 = d.reset_index()
+            ind, v, c = df1.columns
+
+            out_iv = df1.groupby(v).agg({c: 'sum', ind: 'count'}).reset_index()
+            out_iv = out_iv[(out_iv[c] != 0) & (out_iv[c] != out_iv[ind])]
+
+            out_iv['good'] = out_iv[ind] - out_iv[c]
+            out_iv[ind] = out_iv[ind] / np.sum(out_iv[ind])
+            out_iv[c] = out_iv[c] / np.sum(out_iv[c])
+            out_iv['good'] = out_iv['good'] / np.sum(out_iv['good'])
+
+            out_iv['iv'] = (out_iv['good'] - out_iv[c]) * np.log(out_iv['good'] / out_iv[c])
+
+            return out_iv['iv'].sum()
+
+        if sample_name is None:
+            sample_name = self.train_name
+        if features is None:
+            features = self.features
+        df = self.samples[sample_name]
+        return pd.DataFrame.from_dict({f: iv_bin(df[[f, self.target]]) for f in features}, orient='index', columns=[sample_name])
+
+    def add_cross_description(self, features):
+        """
+        Генерирует и добавляет описание для кросс-переменной
+        :param features:
+        :return:
+        """
+        if self.feature_descriptions is None:
+            return None
+        for f in features:
+            f = rem_suffix(f)
+            if is_cross(f) and f not in self.feature_descriptions.index:
+                descr = 'Кросс переменная ' + ' & '.join(['"' +  ('; '.join([l for l in self.feature_descriptions[self.feature_descriptions.index == fi].astype('str').values.flatten().tolist() if not pd.isnull(l) and l != 'nan'])
+                                                                  if fi in self.feature_descriptions.index else fi) + '"' for fi in cross_split(f)])
+                self.feature_descriptions = pd.concat([self.feature_descriptions,
+                           pd.DataFrame({'feature': f, self.feature_descriptions.columns[0]: descr}, index=[0]).set_index('feature')])
+                self.feature_titles[f] = f + '\n\n' + '\n'.join(wrap(descr, 75))

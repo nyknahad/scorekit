@@ -3,7 +3,7 @@
 from ..data import DataSamples
 from ..woe import WOE
 from ..bankmetrics import *
-from .._utils import fig_to_excel, adjust_cell_width, add_suffix, rem_suffix
+from .._utils import fig_to_excel, adjust_cell_width, add_suffix, rem_suffix, is_cross, cross_name, cross_split, add_ds_folder
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -13,11 +13,9 @@ from matplotlib.ticker import FuncFormatter
 import seaborn as sns
 from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split, GridSearchCV, PredefinedSplit
 from sklearn.linear_model import LogisticRegression, LinearRegression, SGDClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import roc_curve, auc, r2_score
-from scipy.stats import chi2, chisquare, ks_2samp, ttest_ind
+from sklearn.metrics import roc_curve, auc, r2_score, make_scorer
+from scipy.stats import chi2, chisquare, ks_2samp, ttest_ind, kstest
 import warnings
-from abc import ABCMeta, abstractmethod
 from patsy import dmatrices
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 import re
@@ -41,42 +39,13 @@ import cloudpickle
 import base64
 
 warnings.simplefilter('ignore')
-plt.rc('font', family='Verdana', size=12)
+plt.rc('font', family='Verdana', size=11)
 plt.style.use('seaborn-darkgrid')
 pd.set_option('display.precision', 3)
 gc.enable()
 
 
-class ScoringModel(metaclass=ABCMeta):
-    '''
-    Base class for binary scoring models
-    '''
-
-    @abstractmethod
-    def __init__(self, clf):
-        self.clf = clf
-        self.features = []
-
-    @abstractmethod
-    def fit(self, data):
-        pass
-#---------------------------------------------------------------
-
-
-class DecisionTreeModel(ScoringModel):
-    '''
-    Decision tree classifier
-    '''
-    def __init__(self, **args):
-        self.clf = DecisionTreeClassifier(**args)
-        self.features = []
-
-    def fit(self, ds):
-        self.clf.fit(ds.samples[ds.train_name][ds.features], ds.samples[ds.train_name][ds.target])
-
-#---------------------------------------------------------------
-
-class LogisticRegressionModel(ScoringModel):
+class LogisticRegressionModel:
     """
     Классификатор лог регрессии
     """
@@ -91,16 +60,11 @@ class LogisticRegressionModel(ScoringModel):
         """
         self.ds = copy.deepcopy(ds)
         self.transformer = transformer
-        if self.ds is not None and self.transformer is not None:
-            self.ds = self.transformer.transform(self.ds, verbose=True)
-        try:
-            random_state = self.ds.random_state
-        except:
-            random_state = 0
         if clf is not None:
             self.clf = clf
         else:
-            self.clf = SGDClassifier(loss='log', penalty='l2', max_iter=1000, alpha=0.001, random_state=random_state)
+            self.clf = SGDClassifier(loss='log', penalty='l2', max_iter=1000, alpha=0.001,
+                                     random_state=self.ds.random_state if self.ds is not None else 0)
         print(f'Chosen model classifier is {self.clf}')
         self.round_digits = round_digits
         self.name = name
@@ -117,9 +81,10 @@ class LogisticRegressionModel(ScoringModel):
         """
         model = {p: self.__dict__[p] for p in ['name', 'coefs', 'intercept', 'calibration', 'scale', 'round_digits']}
         model['clf'] = base64.b64encode(cloudpickle.dumps(self.clf)).decode()
-        if self.transformer is not None:
-            model['scorecard'] = base64.b64encode(cloudpickle.dumps(self.transformer.export_scorecard(features=[f[:-4] for f in self.coefs], full=False).drop(['target_rate', 'sample_part'], axis=1))).decode()
+        if self.transformer is not None and self.coefs:
+            model['scorecard'] = base64.b64encode(cloudpickle.dumps(self.transformer.export_scorecard(features=[rem_suffix(f) for f in self.coefs], full=False).drop(['target_rate', 'sample_part'], axis=1))).decode()
         if file_name is not None:
+            file_name = add_ds_folder(self.ds, file_name)
             with open(file_name, 'w', encoding='utf-8') as file:
                 json.dump(model, file, ensure_ascii=False, indent=4, cls=NpEncoder)
             print(f'The model was successfully saved to file {file_name}')
@@ -158,7 +123,7 @@ class LogisticRegressionModel(ScoringModel):
                 scorecard = pd.DataFrame(model['scorecard'])
             except:
                 scorecard = cloudpickle.loads(base64.b64decode(model['scorecard']))
-            self.transformer = WOE(scorecard=scorecard)
+            self.transformer = WOE(ds=self.ds, scorecard=scorecard)
         if self.coefs:
             self.features = list(self.coefs.keys())
 
@@ -186,7 +151,7 @@ class LogisticRegressionModel(ScoringModel):
         if data is not None:
             if isinstance(data, pd.DataFrame):
                 print(f"\n{' Creating DataSamples ':-^150}\n")
-                self.ds = DataSamples(samples={'train': data}, target=target, time_column=time_column, id_column=id_column,
+                self.ds = DataSamples(samples={'Train': data}, target=target, time_column=time_column, id_column=id_column,
                                  feature_descriptions=feature_descriptions, result_folder=result_folder, n_jobs=n_jobs)
                 self.ds.samples_split()
             else:
@@ -194,36 +159,32 @@ class LogisticRegressionModel(ScoringModel):
                 if n_jobs is not None:
                     self.ds.n_jobs = n_jobs
                 if result_folder and isinstance(result_folder, str):
-                    if result_folder and not os.path.exists(result_folder):
+                    if not os.path.exists(result_folder):
                         os.makedirs(result_folder)
                     self.ds.result_folder = result_folder + ('/' if result_folder and not result_folder.endswith('/') else '')
 
-        print(f"\n{' SFA ':-^150}\n")
         if self.transformer is None:
             self.transformer = WOE(ds=self.ds)
-            self.transformer.auto_fit(plot_flag=-1, method=method, SM_on=False, BL_allow_Vlogic_to_increase_gini=15,
-                                      G_on=False, WOEO_on=False)
+            self.transformer.auto_fit(plot_flag=-1, method=method)
         else:
             print('Using existing self.transformer.')
-        print(f"\n{' MFA ':-^150}\n")
         if not self.coefs:
             self.ds = self.transformer.transform(self.ds, verbose=True)
-            self.mfa(gini_threshold=10, PSI=validate, result_file=f'{self.name + "_" if self.name else ""}mfa.xlsx')
+            self.mfa(gini_threshold=10, result_file=f'{self.name + "_" if self.name else ""}mfa.xlsx')
         else:
             print('Using existing self.coefs.')
-            self.report(out=out, sheet_name=None, pvalue_threshold=0.05, PSI=validate, verbose=False)
+            self.report(out=out, sheet_name=None, pvalue_threshold=0.05, verbose=False)
 
         if save_model:
             self.save_model(file_name=f'{self.ds.result_folder}{save_model}')
         if validate:
-            print(f"\n{' Validation ':-^150}\n")
             self.validate(result_file='auto_validation.xlsx')
 
-    def mfa(self, ds=None, features=None, hold=None, verbose=True, gini_threshold=5,
-            corr_method='pearson', corr_threshold=0.75, drop_with_most_correlations=False,
-            selection_type='stepwise', pvalue_threshold=0.05, pvalue_priority=False,
-            scoring='gini', score_delta=0.1, cv=None, drop_positive_coefs=True,
-            result_file='mfa.xlsx', PSI=True):
+    def mfa(self, ds=None, features=None, hold=None, features_ini=None, limit_to_add=100, gini_threshold=5,
+            corr_method='pearson', corr_threshold=0.75, drop_with_most_correlations=False, selection_type='stepwise',
+            pvalue_threshold=0.05, pvalue_priority=False, scoring='gini', score_delta=0.1, cv=None,
+            drop_positive_coefs=True, crosses_simple=True, crosses_max_num=10,
+            verbose=True, result_file='mfa.xlsx', metrics=None, metrics_cv=None):
         """
         Многофакторный отбор. Проходит в 4 основных этапа:
 
@@ -256,7 +217,8 @@ class LogisticRegressionModel(ScoringModel):
                    При None берется self.ds
         :param features: исходный список переменных для МФА. При None берутся все переменные, по которым есть активный биннинг
         :param hold: список переменных, которые обязательно должны войти в модель
-        :param verbose: флаг для вывода подробных комментариев в процессе работы
+        :param features_ini: список переменных, с которых стартует процедура отбора. Они могут быть исключены в процессе отбора
+        :param limit_to_add: максимальное кол-во переменных, которые могут быть добавлены к модели
         :param gini_threshold: граница по джини для этапа 1
         :param corr_method: метод расчета корреляций для этапа 2. Доступны варианты 'pearson', 'kendall', 'spearman'
         :param corr_threshold: граница по коэффициенту корреляции для этапа 2
@@ -268,149 +230,266 @@ class LogisticRegressionModel(ScoringModel):
                 Варианты значений: 'gini', 'AIC', 'BIC' + все метрики доступные для вычисления через sklearn.model_selection.cross_val_score.
                 Все информационные метрики после вычисления умножаются на -1 для сохранения логики максимизации метрики.
         :param score_delta: минимальный прирост метрики для этапа 3
-        :param cv: параметр cv для вычисления скора sklearn.model_selection.cross_val_score для этапа 3.
-                    При None берется StratifiedKFold(5, shuffle=True)
+        :param cv: параметр cv для вызова sklearn.model_selection.cross_val_score. При None берется StratifiedKFold(5, shuffle=True)
         :param drop_positive_coefs: флаг для выполнения этапа 4
-        :param result_file: файл, в который будут сохраняться результаты мфа
-        :param PSI: флаг для проведения анализа PSI отобранных в модель факторов
+
+        --- Кросс переменные ---
+        :param crosses_simple: True  - после трансформации кросс-переменные учавствут в отборе наравне со всеми переменными
+                               False - сначала выполняется отбор только на основных переменных,
+                                       затем в модель добавляются по тем же правилам кросс переменные, но не более, чем crosses_max_num штук
+        :param crosses_max_num: максимальное кол-во кросс переменных в модели. учитывается только при crosses_simple=False
+
+        --- Отчет ---
+        :param verbose: флаг для вывода подробных комментариев в процессе работы
+        :param result_file: название файла отчета. При None результаты не сохраняются
+        :param metrics: список метрик/тестов, результы расчета которых должны быть включены в отчет.
+                          Элементы списка могут иметь значения (не чувствительно к регистру):
+                              'ontime': расчет динамики джини по срезам,
+                              'vif'   : расчет Variance Inflation Factor,
+                              'psi'   : расчет Population Population Stability Index,
+                              'wald'  : тест Вальда,
+                              'ks'    : тест Колмогорова-Смирнова,
+                              func    : пользовательская функция, которая принимает целевую и зависимую переменную,
+                                        и возвращает числовое значение метрики
+
+                                        Например,
+                                        def custom_metric(y_true, y_pred):
+                                            from sklearn.metrics import roc_curve, f1_score
+                                            fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+                                            thres = thresholds[np.argmax(tpr * (1 - fpr))]
+                                            return f1_score(y_true, (y_pred > thres).astype(int))
+                                        metrics = ['vif', 'ks', 'psi', custom_metric]
+        :param metrics_cv: список метрик, рассчитываемых через sklearn.model_selection.cross_val_score.
+                          Аналогично параметру metrics элементами могут быть строки, поддерживаемые cross_val_score, либо пользовательские функции
+                          Например, ['roc_auc', 'neg_log_loss', 'gini', 'f1', 'accuracy', custom_metric]
         """
+        print(f"\n{' MFA ':-^150}\n")
         if ds is not None:
             self.ds = copy.deepcopy(ds)
-            if self.transformer is not None:
-                self.ds = self.transformer.transform(self.ds, features=features, verbose=verbose)
-        if features is None:
-            features = self.ds.features
+        if self.transformer is not None:
+            self.ds = self.transformer.transform(self.ds, features=features, verbose=verbose)
+        if features is None or self.transformer is not None:
+            features = self.ds.features.copy()
+        if features_ini is None:
+            features_ini = []
+        hold = set() if hold is None else {add_suffix(f) if add_suffix(f) in features else f for f in hold}
+        features_ini = [add_suffix(f) for f in features_ini]
+        gini_df = self.ds.calc_gini(add_description=True, features=features)
+        if not crosses_simple:
+            cross_features = [f for f in features if is_cross(f)]
+            features = [f for f in features if not is_cross(f)]
+        drop_features_gini, drop_features_corr, selection_fig, regularized_fig = \
+            self.mfa_steps(features=features, hold=hold, gini_threshold=gini_threshold, corr_method=corr_method,
+                           corr_threshold=corr_threshold, drop_with_most_correlations=drop_with_most_correlations,
+                           selection_type=selection_type, pvalue_threshold=pvalue_threshold, pvalue_priority=pvalue_priority,
+                           scoring=scoring, score_delta=score_delta, cv=cv, drop_positive_coefs=drop_positive_coefs,
+                           features_ini=features_ini, limit_to_add=limit_to_add, verbose=verbose, gini_df=gini_df)
+        if not crosses_simple and crosses_max_num > 0 and cross_features:
+            print(f"\n{' MFA for cross features ':-^125}\n")
+            cross_drop_features_gini, cross_drop_features_corr, cross_selection_fig, cross_regularized_fig = \
+                self.mfa_steps(features=cross_features, hold=hold, gini_threshold=gini_threshold, corr_method=corr_method,
+                               corr_threshold=corr_threshold, drop_with_most_correlations=drop_with_most_correlations,
+                               selection_type='stepwise', pvalue_threshold=pvalue_threshold, pvalue_priority=pvalue_priority,
+                               scoring=scoring, score_delta=score_delta, cv=cv, drop_positive_coefs=drop_positive_coefs,
+                               features_ini=self.features, limit_to_add=crosses_max_num, verbose=verbose, gini_df=gini_df)
         else:
-            features = [add_suffix(f) if add_suffix(f) in self.ds.features else f for f in features]
-        if hold is None:
-            hold = []
-        else:
-            hold = [add_suffix(f) if add_suffix(f) in self.ds.features else f for f in hold]
-        if cv is None:
-            cv = StratifiedKFold(5, shuffle=True)
+            cross_drop_features_gini, cross_drop_features_corr, cross_selection_fig, cross_regularized_fig = [], {}, None, None
+        if result_file is not None:
+            with pd.ExcelWriter(self.ds.result_folder + result_file,  engine='xlsxwriter') as writer:
+                gini_df[gini_df.index.isin(drop_features_gini)].to_excel(writer, sheet_name='Gini below threshold')
+                adjust_cell_width(writer.sheets['Gini below threshold'], gini_df)
+                gini_df['Drop reason'] = gini_df.index.map(drop_features_corr)
+                self.ds.corr_mat(sample_name=self.ds.train_name, features=features, description_df=gini_df).to_excel(writer, sheet_name='Correlation analysis')
+                adjust_cell_width(writer.sheets['Correlation analysis'], gini_df)
+                add_figs = [selection_fig, regularized_fig]
+                if not crosses_simple and crosses_max_num > 0 and cross_features:
+                    gini_df[gini_df.index.isin(cross_drop_features_gini)].to_excel(writer, sheet_name='Cross Gini below threshold')
+                    adjust_cell_width(writer.sheets['Cross Gini below threshold'], gini_df)
+                    gini_df['Drop reason'] = gini_df.index.map(cross_drop_features_corr)
+                    self.ds.corr_mat(sample_name=self.ds.train_name, features=cross_features, description_df=gini_df).to_excel(writer, sheet_name='Cross Correlation analysis')
+                    adjust_cell_width(writer.sheets['Cross Correlation analysis'], gini_df)
+                    add_figs += [cross_selection_fig, cross_regularized_fig]
+                self.report(out=writer, sheet_name=selection_type, pvalue_threshold=pvalue_threshold, verbose=verbose,
+                            add_figs=add_figs, gini_df=gini_df.drop(['Drop reason'], axis=1), metrics=metrics, metrics_cv=metrics_cv, cv=cv)
 
-        sample_name = self.ds.train_name
-        gini_df = self.ds.calc_gini(add_description=True, features=features).round(self.round_digits)
-        ginis = self.ds.ginis[sample_name]
-        
-        drop_features_gini = [f for f in ginis if abs(ginis[f]) < gini_threshold and f not in hold]
-        features = [f for f in sorted(ginis, key=ginis.get, reverse=True) if f not in drop_features_gini]
+    def mfa_steps(self, features=None, hold=None, gini_threshold=5, verbose=False,
+                  corr_method='pearson', corr_threshold=0.75, drop_with_most_correlations=False, 
+                  selection_type='stepwise', pvalue_threshold=0.05, pvalue_priority=False,
+                  scoring='gini', score_delta=0.1, cv=None, drop_positive_coefs=True, 
+                  features_ini=None, limit_to_add=100, gini_df=None):
+        if cv is None:
+            cv = StratifiedKFold(5, shuffle=True, random_state=self.ds.random_state)
+        if gini_df is None:
+            gini_df = self.ds.calc_gini(add_description=True, features=features)
+        ginis = gini_df[self.ds.train_name].to_dict()
+        features = sorted(features, key=ginis.get(0), reverse=True)
+        drop_features_gini = [f for f in features if abs(ginis.get(f, 0)) < gini_threshold and f not in hold]
+        features = [f for f in features if f not in drop_features_gini]
         if verbose:
-            print(f'\n---------------------------------------------- Step 1 ----------------------------------------------')
+            print(f"\n{' Step 1 ':-^100}")
             print(f'Dropped features with gini lower {gini_threshold}: {drop_features_gini}')
         if not features:
             print('Features set is empty. Break.')
-            return None
+            self.features = []
+            return drop_features_gini, {}, None, None
         if verbose:
-            print(f'\n---------------------------------------------- Step 2 ----------------------------------------------')
-        drop_features_corr = self.ds.CorrelationAnalyzer(sample_name=sample_name, features=features, hold=hold,
-                                                         drop_with_most_correlations=drop_with_most_correlations,
+            print(f"\n{' Step 2 ':-^100}")
+        drop_features_corr = self.ds.CorrelationAnalyzer(sample_name=self.ds.train_name, features=features, hold=hold,
+                                                         scores=ginis, drop_with_most_correlations=drop_with_most_correlations,
                                                          method=corr_method, threshold=corr_threshold, verbose=verbose)
-        with pd.ExcelWriter(self.ds.result_folder + result_file,  engine='xlsxwriter') as writer:
-            gini_df[gini_df.index.isin(drop_features_gini)].to_excel(writer, sheet_name='Gini below threshold')
-            adjust_cell_width(writer.sheets['Gini below threshold'], gini_df)
-            gini_df_copy = self.ds.gini_df.copy()
-            self.ds.gini_df['Drop reason'] = self.ds.gini_df.index.map(drop_features_corr)
-            self.ds.corr_mat(sample_name=sample_name).to_excel(writer, sheet_name='Correlation analysis')
-            adjust_cell_width(writer.sheets['Correlation analysis'], self.ds.gini_df)
-            self.ds.gini_df = gini_df_copy.copy()
-            features = [f for f in features if f not in drop_features_corr]
+        features = [f for f in features if f not in drop_features_corr]
+        if verbose:
+            print(f"\n{' Step 3 ':-^100}")
+        if selection_type in ['stepwise', 'forward', 'backward']:
+            features, selection_fig = self.stepwise_selection(features=features, hold=hold, features_ini=features_ini, 
+                                                              limit_to_add=limit_to_add, verbose=verbose,
+                                                              score_delta=score_delta, scoring=scoring, cv=cv,
+                                                              pvalue_threshold=pvalue_threshold,
+                                                              pvalue_priority=pvalue_priority,
+                                                              selection_type=selection_type)
+        else:
+            if selection_type != 'regularized':
+                print('Incorrect selection_type value. Set to regularized.')
+            selection_type = 'regularized'
+            selection_fig = None
+        if drop_positive_coefs:
             if verbose:
-                print(f'\n---------------------------------------------- Step 3 ----------------------------------------------')
-            if selection_type in ['stepwise', 'forward', 'backward']:
-                features, selection_fig = self.stepwise_selection(features=features, hold=hold, verbose=verbose,
-                                                                  score_delta=score_delta, scoring=scoring, cv=cv,
-                                                                  pvalue_threshold=pvalue_threshold,
-                                                                  pvalue_priority=pvalue_priority, selection_type=selection_type)
-            else:
-                selection_type = 'regularized'
-                selection_fig = None
-            if drop_positive_coefs:
-                if verbose:
-                    print(f'\n---------------------------------------------- Step 4 ----------------------------------------------')
-                features, regularized_fig = self.regularized_selection(features=features, hold=hold, scoring=scoring, cv=cv,
-                                                                       pvalue_threshold=pvalue_threshold, verbose=verbose)
-            else:
-                regularized_fig = None
-            features = [f for f in sorted(ginis, key=ginis.get, reverse=True) if f in features]
-            print(f'\n------------------------------------------- Final model --------------------------------------------')
-            self.fit(features=features)
-            self.report(out=writer, sheet_name=selection_type, pvalue_threshold=pvalue_threshold, PSI=PSI, verbose=verbose)
-            row = 0
-            if selection_fig:
-                fig_to_excel(selection_fig, writer.sheets[selection_type], row=row, col=len(gini_df.columns) + max(len(self.features), len(self.ds.samples)) + 21)
-                row = +30
-            if regularized_fig:
-                fig_to_excel(regularized_fig, writer.sheets[selection_type], row=row, col=len(gini_df.columns) + max(len(self.features), len(self.ds.samples)) + 21)
-        plt.close('all')
+                print(f"\n{' Step 4 ':-^100}")
+            features, regularized_fig = self.regularized_selection(features=features, hold=hold, scoring=scoring, cv=cv,
+                                                                   pvalue_threshold=pvalue_threshold, verbose=verbose)
+        else:
+            regularized_fig = None
+        features = sorted([f for f in features if not is_cross(f)], key=ginis.get(0), reverse=True) + sorted([f for f in features if is_cross(f)], key=ginis.get(0), reverse=True)
+        print(f"\n{' Final model ':-^100}")
+        self.fit(features=features)
+        return drop_features_gini, drop_features_corr, selection_fig, regularized_fig
 
-    def report(self, ds=None, out='report.xlsx', sheet_name=None, pvalue_threshold=0.05, PSI=False, verbose=False):
+    def report(self, ds=None, out='report.xlsx', sheet_name=None, pvalue_threshold=0.05, verbose=False, add_figs=None,
+               gini_df=None, metrics=None, metrics_cv=None, cv=None):
         """
         Генерация отчета по обученной модели.
         :param ds: ДатаСэмпл. В случае, если он не содержит трансформированные переменные, то выполняется трансформация трансформером self.transformer
         :param out: либо строка с названием эксель файла, либо объект pd.ExcelWriter для сохранения отчета
         :param sheet_name: название листа в экселе
         :param pvalue_threshold: граница по p-value. Используется только для выделения значений p-value цветом
-        :param PSI: флаг проведение тестов PSI
         :param verbose: флаг вывода комментариев в процессе работы
+        :param add_figs: список из графиков, которые должны быть добавлены в отчет
+        :param gini_df: датафрейм с джини всех переменных модели
+        :param metrics: список метрик/тестов, результы расчета которых должны быть включены в отчет.
+                          Элементы списка могут иметь значения (не чувствительно к регистру):
+                              'ontime': расчет динамики джини по срезам,
+                              'vif'   : расчет Variance Inflation Factor,
+                              'psi'   : расчет Population Population Stability Index,
+                              'wald'  : тест Вальда,
+                              'ks'    : тест Колмогорова-Смирнова,
+                              func    : пользовательская функция, которая принимает целевую и зависимую переменную,
+                                        и возвращает числовое значение метрики
+
+                                        Например,
+                                        def custom_metric(y_true, y_pred):
+                                            from sklearn.metrics import roc_curve, f1_score
+                                            fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+                                            thres = thresholds[np.argmax(tpr * (1 - fpr))]
+                                            return f1_score(y_true, (y_pred > thres).astype(int))
+                                        metrics = ['vif', 'ks', 'psi', custom_metric]
+        :param metrics_cv: список метрик, рассчитываемых через sklearn.model_selection.cross_val_score.
+                          Аналогично параметру metrics элементами могут быть строки, поддерживаемые cross_val_score, либо пользовательские функции
+                          Например, ['roc_auc', 'neg_log_loss', 'gini', 'f1', 'accuracy', custom_metric]
+        :param cv: параметр cv для вызова sklearn.model_selection.cross_val_score
         """
         if ds is None:
-            ds = self.ds
+            ds = copy.deepcopy(self.ds)
         if sheet_name is None:
-            if self.name:
-                sheet_name = self.name
-            else:
-                sheet_name = 'model'
-        if not self.coefs:
+            sheet_name = self.name if self.name else 'model'
+        if not self.coefs or not self.features:
             print('Please fit your model before calling this method.')
             return None
         if isinstance(out, str):
-            writer = pd.ExcelWriter(ds.result_folder + out, engine='xlsxwriter')
+            writer = pd.ExcelWriter(add_ds_folder(ds, out), engine='xlsxwriter')
         elif isinstance(out, pd.ExcelWriter):
             writer = out
         else:
             print('Parameter out must have str or pd.ExcelWriter type.')
             return None
-        if self.transformer is not None:
-            ds = self.transformer.transform(ds, features=self.features, verbose=verbose)
-        if ds.gini_df is not None:
-            gini_df = ds.gini_df.copy()
-        else:
-            gini_df = ds.calc_gini(features=self.features, add_description=True, abs=True).round(self.round_digits)
-        gini_df = gini_df.rename_axis('feature').reset_index()
-        for name, sample in ds.samples.items():
-            wald_df = self.wald_test(ds, sample_name=name, features=self.features)
-            if name != ds.train_name:
-                wald_df = wald_df[['p-value', 'feature']]
-            wald_df = wald_df.rename({'p-value': f'p-value {name}'}, axis=1)
-            gini_df = gini_df.merge(wald_df, on='feature', how='right')
-        gini_df = gini_df.merge(ds.VIF(features=self.features).reset_index().set_axis(['feature', 'VIF'], axis=1, inplace=False),
-            on='feature', how='left').sort_values(by=[ds.train_name], ascending=False, na_position='last')
-
+        print('Generating report...')
+        if metrics is None:
+            metrics = ['wald', 'ks', 'vif', 'iv', 'psi', 'ontime']
+        metrics = [t.lower() if isinstance(t, str) else t for t in metrics]
         if verbose:
             self.draw_coefs()
-        ginis_model, roccurve_fig = self.roc_curve(ds, verbose=verbose)
-        print('Generating report...')
-        gini_df = pd.concat([gini_df, pd.DataFrame.from_dict({**ginis_model, **{'feature': 'model'}}, orient='index').T]).set_index('feature')
-        gini_df.style.applymap(lambda x: 'color: red' if x > pvalue_threshold else 'color: orange' if x > pvalue_threshold / 5 else 'color: black',
-                               subset=pd.IndexSlice[:, [f for f in gini_df if f.startswith('p-value')]]) \
+        score_field = 'model_score'
+        if self.transformer is not None:
+            ds = self.transformer.transform(ds, features=self.features, verbose=verbose)
+        ds = self.scoring(ds, score_field=score_field)
+        if gini_df is None:
+            gini_df = ds.calc_gini(add_description=True, features=self.features)
+        gini_df = gini_df.merge(pd.DataFrame.from_dict({**self.coefs, **{'intercept': self.intercept}}, orient='index', columns=['coefficient']), left_index=True, right_index=True, how='right')
+        model_gini = ds.calc_gini(features=[score_field], abs=True)
+        gini_df = pd.concat([gini_df, model_gini]).rename_axis('feature')
+        gini_df.columns = [('Gini', c) if c in list(ds.samples) + ['Bootstrap mean', 'Bootstrap std'] else (c, '') for c in gini_df.columns]
+        for m in metrics:
+            if m == 'wald':
+                wald_df = pd.concat([self.wald_test(ds, sample_name=name, features=self.features)[['se', 'p-value'] if name == ds.train_name else ['p-value']].rename({'p-value': name}, axis=1) for name, sample in ds.samples.items()], axis=1)
+                wald_df.columns = [('Wald p-value', c) if c in list(ds.samples) else (c, '') for c in wald_df.columns]
+                gini_df = gini_df.merge(wald_df, left_index=True, right_index=True, how='left')
+            elif m == 'ks':
+                gini_df = gini_df.merge(pd.concat([ds.KS_test(sample_name=name, features=self.features + [score_field]).set_axis([('Kolmogorov-Smirnov test', name)], axis=1) for name in ds.samples], axis=1), left_index=True, right_index=True, how='left')
+            elif m == 'vif':
+                gini_df = gini_df.merge(pd.concat([ds.VIF(features=self.features, sample_name=name).set_axis([('VIF', name)], axis=1) for name in ds.samples], axis=1), left_index=True, right_index=True, how='left')
+            elif m == 'iv':
+                gini_df = gini_df.merge(pd.concat([ds.IV_test(features=self.features, sample_name=name).set_axis([('IV', name)], axis=1) for name in ds.samples], axis=1), left_index=True, right_index=True, how='left')
+            elif callable(m):
+                gini_df = gini_df.merge(pd.concat([pd.DataFrame.from_dict({f: m(sample[ds.target], sample[f]) for f in self.features + [score_field]}, orient='index', columns=[(m.__name__, name)]) for name, sample in ds.samples.items()], axis=1), left_index=True, right_index=True, how='left')
+
+        gini_df.columns = pd.MultiIndex.from_tuples(gini_df.columns)
+        gini_df.rename(index={score_field: 'model'}).style.applymap(lambda x: 'color: red' if x > pvalue_threshold else 'color: orange' if x > pvalue_threshold / 5 else 'color: black',
+                               subset=pd.IndexSlice[:, [f for f in gini_df if f[0] == 'Wald p-value']]) \
             .to_excel(writer, sheet_name=sheet_name, startrow=1, startcol=0, float_format=f'%0.{self.round_digits}f')
-        ds.gini_df = None
-        ds.corr_mat(features=self.features)\
-            .to_excel(writer, sheet_name=sheet_name, startrow=1, startcol=len(gini_df.columns) + 3)
+        ds.corr_mat(features=self.features).to_excel(writer, sheet_name=sheet_name, startrow=3, startcol=len(gini_df.columns) + 3)
         ws = writer.sheets[sheet_name]
-        descr_len = sum([1 for f in gini_df.columns if not pd.api.types.is_numeric_dtype(gini_df[f]) and f not in ginis_model])
+        descr_len = len(ds.feature_descriptions.columns) if ds.feature_descriptions is not None else 0
         ws.set_column(0, 0 + descr_len, 30)
         ws.set_column(1 + descr_len, gini_df.shape[1], 15)
         ws.set_column(len(gini_df.columns) + 3, gini_df.shape[1] + 3, 30)
         ws.write(0, 0, 'Features in model:')
         ws.write(0, len(gini_df.columns) + 3, 'Correlations matrix:')
-        fig_to_excel(roccurve_fig, ws, row=0, col=gini_df.shape[1] + max(len(self.features), len(ds.samples)) + 6)
-
-        if ds.time_column:
-            ws.write(len(self.features) + 5, gini_df.shape[1] + 3, 'Model Gini dynamics:')
-            model_gini = self.calc_gini_in_time(ds)
-            model_gini.to_excel(writer, sheet_name=sheet_name, startrow=len(self.features) + 6, startcol=gini_df.shape[1] + 3)
+        m_col = 10
+        if metrics_cv:
+            model_metrics = []
+            for m in metrics_cv:
+                if callable(m):
+                    try:
+                        metric = {'Metric': m.__name__}
+                        m = make_scorer(m)
+                    except:
+                        metric = {'Metric': str(m)}
+                else:
+                    metric = {'Metric': str(m)}
+                for name, sample in ds.samples.items():
+                    scores = cross_val_score(self.clf, sample[self.features], sample[ds.target], cv=cv, scoring=m if m != 'gini' else 'roc_auc')
+                    if m == 'gini':
+                        scores = np.array([2*x - 1 for x in scores])
+                    metric[f'{name} mean'] = round(scores.mean(), self.round_digits)
+                    metric[f'{name} std'] = round(scores.std(), self.round_digits)
+                model_metrics.append(metric)
+            ws.write(len(self.features) + 7, m_col, 'Model metrics on cross-validation:')
+            pd.DataFrame(model_metrics).set_index('Metric').to_excel(writer, sheet_name=sheet_name, startrow=len(self.features) + 8, startcol=m_col)
+            m_col += len(ds.samples)*2 + 3
+        fig_to_excel(self.roc_curve(ds, verbose=verbose, score_field=score_field), ws, row=0,
+                     col=gini_df.shape[1] + max(len(self.features), len(ds.samples)) + 6)
+        if add_figs:
+            row = 0
+            for fig in add_figs:
+                if fig:
+                    fig_to_excel(fig, ws, row=row, col=len(gini_df.columns) + max(len(self.features), len(ds.samples)) + 16)
+                    row = +16
+        print(model_gini.rename(index={score_field: 'Gini'}))
+        if 'ontime' in metrics and ds.time_column:
+            ws.write(len(self.features) + 7, m_col, 'Model Gini dynamics:')
+            features_gini = ds.calc_gini_in_time(features=self.features + [score_field], abs=True)
+            model_gini = features_gini.iloc[:, features_gini.columns.get_level_values(0) == score_field].copy()
+            model_gini.columns = model_gini.columns.droplevel()
+            model_gini.to_excel(writer, sheet_name=sheet_name, startrow=len(self.features) + 8, startcol=m_col)
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
             for name in ds.samples:
                 ax.plot(model_gini.index, model_gini[name], label=name, marker='o')
@@ -427,35 +506,29 @@ class LogisticRegressionModel(ScoringModel):
             ax.tick_params(axis='both', which='both', length=5, labelbottom=True)
             ax.xaxis.get_label().set_visible(False)
             ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=12)
-            fig_to_excel(fig, ws, row=len(self.features) + len(model_gini) + 9, col=len(gini_df.columns) + 1, scale=0.75)
-            ws.write(len(self.features) + len(model_gini) + 34, len(gini_df.columns) + 3, 'Features Gini dynamics:')
-            features_gini = ds.calc_gini_in_time(features=self.features, abs=True)
-            features_gini.to_excel(writer, sheet_name=sheet_name, startrow=len(self.features) + len(model_gini) + 35,
-                                   startcol=gini_df.shape[1] + 3)
+            fig_to_excel(fig, ws, row=len(self.features) + len(model_gini) + 11, col=m_col - 1, scale=0.75)
+            ws.write(len(self.features) + len(model_gini) + 36, m_col, 'Features Gini dynamics:')
+            features_gini.iloc[:, features_gini.columns.get_level_values(0) != score_field].to_excel(writer, sheet_name=sheet_name,
+                                    startrow=len(self.features) + len(model_gini) + 28, startcol=m_col)
 
         if self.transformer is not None:
-            ws.write(len(self.features) + 5, 0, 'Scorecard:')
-            scorecard = self.transformer.export_scorecard(features=[f.rsplit('_WOE', maxsplit=1)[0] for f in self.features], full=False)
+            ws.write(len(self.features) + 7, 0, 'Scorecard:')
+            scorecard = self.transformer.export_scorecard(features=[rem_suffix(f) for f in self.features], full=False)
             scorecard.set_index('feature').to_excel(writer, sheet_name=sheet_name,
-                                                    startrow=len(self.features) + 6, startcol=0,
+                                                    startrow=len(self.features) + 8, startcol=0,
                                                     float_format=f'%0.{self.round_digits}f')
-            figs = self.transformer.plot_bins(features=[f.rsplit('_WOE', maxsplit=1)[0] for f in self.features], folder=None,
-                                              plot_flag=verbose)
+            figs = self.transformer.plot_bins(features=[rem_suffix(f) for f in self.features], folder=None, plot_flag=verbose)
             for i, fig in enumerate(figs):
                 fig_to_excel(fig, ws,
-                             row=len(scorecard) + len(self.features) + 9 + i * (20 if ds.time_column is None else 30),
+                             row=len(scorecard) + len(self.features) + 11 + i * (20 if ds.time_column is None else 30),
                              col=0, scale=0.7)
+        else:
+            scorecard = None
 
-        if PSI:
-            if self.transformer is not None:
-                legend_map = {f: {str(self.transformer.feature_woes[f.rsplit('_WOE', maxsplit=1)[0]].woes[
-                                          g]): f"{v}. WOE {self.transformer.feature_woes[f.rsplit('_WOE', maxsplit=1)[0]].woes[g]}"
-                                  for g, v in self.transformer.feature_woes[f.rsplit('_WOE', maxsplit=1)[0]].groups.items()} for f in self.features}
-            else:
-                legend_map = None
+        if 'psi' in metrics:
             result, figs = DataSamples(samples={'Train': ds.to_df(sample_field='sample')[self.features + [ds.target, 'sample']]},
                                        target=ds.target, features=self.features, cat_columns=[],
-                                       time_column='sample').psi(legend_map=legend_map)
+                                       time_column='sample').psi(scorecard=scorecard)
             result.to_excel(writer, sheet_name='PSI_samples')
             ws = writer.sheets['PSI_samples']
             ws.set_column(0, 0, 40)
@@ -463,7 +536,7 @@ class LogisticRegressionModel(ScoringModel):
             for i, fig in enumerate(figs):
                 fig_to_excel(fig, ws, row=i * (20 + 1) + len(self.features) + 3, col=0, scale=0.9)
             if ds.time_column:
-                result, figs = ds.psi(features=self.features, legend_map=legend_map)
+                result, figs = ds.psi(features=self.features, scorecard=scorecard)
                 result.to_excel(writer, sheet_name='PSI_time')
                 ws = writer.sheets['PSI_time']
                 ws.set_column(0, 0, 40)
@@ -472,24 +545,16 @@ class LogisticRegressionModel(ScoringModel):
                     fig_to_excel(fig, ws, row=i * (20 + 1) + len(self.features) + 3, col=0, scale=0.9)
         if isinstance(out, str):
             writer.close()
-    plt.close('all')
+        plt.close('all')
 
-    @staticmethod
-    def get_cv_gini(df, target, features, clf):
-        try:
-            return (2 * cross_val_score(clf, df[features], df[target], cv=5, scoring='roc_auc').mean() - 1) * 100
-        except:
-            return 0
+    def calc_gini(self, ds=None, score_field='model_score'):
+        if ds is None:
+            ds = self.ds
+        if any([score_field not in sample.columns for sample in ds.samples.values()]):
+            ds = self.scoring(ds, score_field=score_field)
+        return ds.calc_gini(features=[score_field], abs=True)
 
-    @staticmethod
-    def get_time_gini(df, time_column, target, features, clf):
-        if len(features) == 1:
-            return {time: DataSamples.get_f_gini(group.drop([time_column], axis=1)) for time, group in df.groupby(time_column)}
-        else:
-            return {time: LogisticRegressionModel.get_cv_gini(group, target, features, clf)
-                    for time, group in df.groupby(time_column)}
-
-    def roc_curve(self, ds=None, verbose=True):
+    def roc_curve(self, ds=None, score_field=None, verbose=True):
         """
         Рассчет джини модели на всех сэмплах и построение ROC-кривой
         :param ds: ДатаСэмпл
@@ -499,105 +564,21 @@ class LogisticRegressionModel(ScoringModel):
         """
         if ds is None:
             ds = self.ds
-        tpr = {}
-        fpr = {}
-        ginis = {}
-        for name, sample in ds.samples.items():
-            fpr[name], tpr[name], _ = roc_curve(sample[ds.target], self.predict_proba(ds, sample_name=name))
-            ginis[name] = round((auc(fpr[name], tpr[name]) * 2 - 1) * 100, self.round_digits)
-        if ds.bootstrap_base is not None:
-            if ds.n_jobs > 1:
-                with futures.ProcessPoolExecutor(max_workers=ds.n_jobs) as pool:
-                    ginis_bootstrap = []
-                    jobs = []
-                    iterations = len(ds.bootstrap)
-                    idx_iter = iter(ds.bootstrap)
-                    while iterations:
-                        for idx in idx_iter:
-                            jobs.append(pool.submit(self.get_cv_gini,
-                                                    df=ds.bootstrap_base.iloc[idx][[ds.target] + self.features],
-                                                    target=ds.target, features=self.features, clf=self.clf))
-                            if len(jobs) > ds.max_queue:
-                                break
-                        for job in futures.as_completed(jobs):
-                            iterations -= 1
-                            ginis_bootstrap.append(job.result())
-                            jobs.remove(job)
-                            break
-                gc.collect()
-            else:
-                ginis_bootstrap = [self.get_cv_gini(df=ds.bootstrap_base.iloc[idx][[ds.target] + self.features],
-                                                    target=ds.target, features=self.features, clf=self.clf)
-                                   for idx in ds.bootstrap]
-            ginis['Bootstrap mean'] = round(np.mean(ginis_bootstrap), self.round_digits)
-            ginis['Bootstrap std'] = round(np.std(ginis_bootstrap), self.round_digits)
-
+        if score_field is None:
+            score_field = 'score'
+            ds = self.scoring(ds, score_field=score_field)
         fig = plt.figure(figsize=(6, 4))
         ax = fig.add_subplot(111)
-        # Plot tpr vs 1-fpr
-        for name in fpr:
-            ax.plot(fpr[name], tpr[name], label=f'{name} (Gini = {ginis[name]})')
-        ax.plot(tpr[list(tpr)[0]],tpr[list(tpr)[0]], 'r')
+        for name, sample in ds.samples.items():
+            fpr, tpr, _ = roc_curve(sample[ds.target], sample[score_field])
+            ax.plot(fpr, tpr, label=f'{name} (Gini = {round((auc(fpr, tpr) * 2 - 1) * 100, 2)})')
+        ax.plot(tpr, tpr, 'r')
         ax.set_xlabel('False Positive Rate')
         ax.set_ylabel('True Positive Rate')
         ax.legend()
         if verbose:
             plt.show()
-        print(pd.DataFrame(ginis, index=['Gini']).to_string())
-        return ginis, fig
-
-    def calc_gini_in_time(self, ds=None, score_field=None):
-        """
-        Расчет динамики джини модели по срезам для всех сэмплов
-        :param ds: ДатаСэмпл
-        :param score_field: поле со скором модели. При None вызывается метод self.scoring() для расчета скора
-
-        :return: ДатаФрейм с джини
-        """
-        if ds is None:
-            ds = self.ds
-        if ds.time_column is None:
-            print('Please set time_column in DataSample for using this method.')
-            return None
-        if score_field is None:
-            score_field = 'score'
-            ds = self.scoring(ds, score_field=score_field)
-        model_gini = {name: self.get_time_gini(sample[[ds.target, score_field, ds.time_column]], time_column=ds.time_column, target=ds.target, features=[score_field], clf=None)
-                      for name, sample in ds.samples.items()}
-
-        if ds.bootstrap_base is not None:
-            if ds.n_jobs > 1:
-                with futures.ProcessPoolExecutor(max_workers=ds.n_jobs) as pool:
-                    ginis_bootstrap = []
-                    jobs = []
-                    iterations = len(ds.bootstrap)
-                    idx_iter = iter(ds.bootstrap)
-                    while iterations:
-                        for idx in idx_iter:
-                            jobs.append(pool.submit(self.get_time_gini,
-                                                    df=ds.bootstrap_base.iloc[idx][[ds.target, ds.time_column] + self.features],
-                                                    time_column=ds.time_column, target=ds.target,
-                                                    features=self.features, clf=self.clf))
-                            if len(jobs) > ds.max_queue:
-                                break
-                        for job in futures.as_completed(jobs):
-                            iterations -= 1
-                            ginis_bootstrap.append(job.result())
-                            jobs.remove(job)
-                            break
-                gc.collect()
-            else:
-                ginis_bootstrap = [self.get_time_gini(df=ds.bootstrap_base.iloc[idx][[ds.target, ds.time_column] + self.features],
-                                                      time_column=ds.time_column, target=ds.target, features=self.features,
-                                                      clf=self.clf)
-                                   for idx in ds.bootstrap]
-            time_values = sorted(ds.bootstrap_base[ds.time_column].unique())
-            model_gini['Bootstrap mean'] = {time: round(np.mean([ginis[time] for ginis in ginis_bootstrap if time in ginis]), self.round_digits) for time in time_values}
-            model_gini['Bootstrap std'] = {time: round(np.std([ginis[time] for ginis in ginis_bootstrap if time in ginis]), self.round_digits) for time in time_values}
-
-        time_values = sorted(list({time for name in model_gini for time in model_gini[name]}))
-        return pd.DataFrame([[time] + [model_gini[name][time] if time in model_gini[name] else 0 for name in model_gini] for time in time_values],
-                            columns=[ds.time_column] + [name for name in model_gini]).set_index(ds.time_column).abs().round(self.round_digits)
+        return fig
 
     def validate(self, ds=None, result_file='validation.xlsx', score_field='score', pd_field='pd', scale_field=None):
         """
@@ -608,6 +589,7 @@ class LogisticRegressionModel(ScoringModel):
         :param pd_field: поле с расчитанным PD
         :param scale_field: поле с расчитанным грейдом
         """
+        print(f"\n{' Validation ':-^150}\n")
         if ds is None:
             ds = self.ds
         if self.transformer is not None:
@@ -813,7 +795,7 @@ class LogisticRegressionModel(ScoringModel):
                                             'color: orange' if x[0] == 'Ж' else
                                             'color: green' if x[0] == 'З' else
                                             'color: black').to_excel(writer, sheet_name='MS', float_format=f'%0.{self.round_digits + 1}f')
-                gini = DataSamples.get_f_gini(df[[ds.target, score_field]])
+                gini = DataSamples.get_f_gini(df[ds.target], df[score_field])
                 pd.DataFrame(
                     [['CT', CT],
                      ['a', self.calibration[0]], ['b', self.calibration[1]],
@@ -924,16 +906,15 @@ class LogisticRegressionModel(ScoringModel):
         pvalue=chi2.sf(wald, 1)
         return pd.DataFrame({'feature': ['intercept'] + features, 'coefficient': coefs_list})\
             .merge(pd.DataFrame({'feature': ['intercept'] + features_to_check, 'se': bse, 'wald': wald, 'p-value': pvalue}),
-                   on='feature', how='left')
+                   on='feature', how='left').set_index('feature')
 
-    def regularized_selection(self, ds=None, features=None, hold=None, scoring='gini',
-                              cv=None, pvalue_threshold=0.05, verbose=False):
+    def regularized_selection(self, ds=None, features=None, hold=None, scoring='gini', cv=None, pvalue_threshold=0.05, verbose=False):
         """
         Отбор факторов на основе регуляризации - строится модель на всех переменных, затем итерационно исключаются
         переменные с нулевыми или положительными коэффициентами и низкой значимостью
         :param ds: ДатаСэмпл. При None берется self.ds
         :param features: исходный список переменных. При None берется self.features
-        :param hold: список переменных, которые обязательно должны остаться после отбора
+        :param hold: список/сет переменных, которые обязательно должны остаться после отбора
         :param scoring: расчитываемый скор модели
         :param pvalue_threshold: граница значимости по p-value
         :param verbose: флаг для вывода подробных комментариев в процессе работы
@@ -942,21 +923,25 @@ class LogisticRegressionModel(ScoringModel):
         """
         if ds is not None:
             self.ds = ds
-        if hold is None:
-            hold = []
-        if features is None:
-            features = self.features.copy()
 
-        sample_name = self.ds.train_name
+        if features is None:
+            if self.features:
+                features = self.features.copy()
+            else:
+                features = self.ds.features.copy()
+        features = [add_suffix(f) if add_suffix(f) in self.ds.features else f for f in features]
+        if hold is None:
+            hold = set()
+        else:
+            hold = {add_suffix(f) if add_suffix(f) in features else f for f in hold}
+
         # correctness check
-        for feature in hold:
-            if feature not in self.ds.features:
-                print ('Feature is not available:', feature)
+        for f in features:
+            if f not in self.ds.samples[self.ds.train_name].columns:
+                print(f'No {f} in DataSample!')
                 return None
 
-        if not self.ds.ginis:
-            self.ds.calc_gini()
-        ginis = self.ds.ginis[sample_name]
+        ginis = self.ds.calc_gini(features=features, samples=[self.ds.train_name])[self.ds.train_name].to_dict()
         scores = []
         features_change = ['Initial']
         to_refit = True
@@ -964,35 +949,29 @@ class LogisticRegressionModel(ScoringModel):
             print(f'Dropping features with positive coefs and high p-values...')
         while to_refit:
             to_refit = False
-            self.clf.fit(self.ds.samples[sample_name][features], self.ds.samples[sample_name][self.ds.target])
+            self.clf.fit(self.ds.samples[self.ds.train_name][features], self.ds.samples[self.ds.train_name][self.ds.target])
             new_score = self.get_score(scoring=scoring, cv=cv, features=features, fit=False)
             scores.append(new_score)
-            positive_to_exclude = {features[i]:self.clf.coef_[0][i] for i in range(len(features)) if self.clf.coef_[0][i] > 0 if features[i] not in hold}
+            positive_to_exclude = {f: c for f, c in zip(features, self.clf.coef_[0]) if c > 0 and f not in hold}
             if positive_to_exclude:
                 to_refit = True
-                features_to_exclude = {x:ginis[x] for x in positive_to_exclude}
+                features_to_exclude = {x: ginis[x] for x in positive_to_exclude}
                 to_exclude = min(features_to_exclude, key=features_to_exclude.get)
                 if verbose:
-                    print(f'To drop: {to_exclude}, gini: {round(ginis[to_exclude], self.round_digits)}, coef: {positive_to_exclude[to_exclude]}')
+                    print(f'To drop: {to_exclude}, gini: {ginis[to_exclude]}, coef: {positive_to_exclude[to_exclude]}')
                 features.remove(to_exclude)
                 features_change.append(f'- {to_exclude}')
             else:
                 wald = self.wald_test(clf=self.clf, features=features)
-                feature_to_exclude_array = wald[(wald['p-value']>pvalue_threshold) & (wald['p-value']==wald['p-value'].max()) & (wald['feature'].isin(hold + ['intercept']) == False)]['feature'].values
+                feature_to_exclude_array = wald[(wald['p-value'] > pvalue_threshold) & (wald['p-value'] == wald['p-value'].max()) & (wald.index.isin(list(hold) + ['intercept']) == False)].index.values
                 if feature_to_exclude_array:
                     to_refit = True
                     if verbose:
-                        print(f'To drop: {feature_to_exclude_array[0]}, gini: {round(ginis[feature_to_exclude_array[0]], self.round_digits)}, p-value: {wald[wald["feature"]==feature_to_exclude_array[0]]["p-value"].values[0]}')
+                        print(f'To drop: {feature_to_exclude_array[0]}, gini: {ginis[feature_to_exclude_array[0]]}, p-value: {wald[wald.index == feature_to_exclude_array[0]]["p-value"].values[0]}')
                     features.remove(feature_to_exclude_array[0])
                     features_change.append(f'- {feature_to_exclude_array[0]}')
 
-        result_features = []
-        for i in range(len(self.clf.coef_[0])):
-            if self.clf.coef_[0][i] == 0:
-                if verbose:
-                    print(f'To drop: {features[i]}, gini: {round(ginis[features[i]], self.round_digits)}, coef: 0')
-            else:
-                result_features.append(features[i])
+        features = [f for f, c in zip(features, self.clf.coef_[0]) if c != 0]
         if len(features_change) > 1:
             fig = plt.figure(figsize=(max(len(features_change)//2, 5), 3))
             plt.plot(np.arange(len(scores)), scores, 'bo-', linewidth=2.0)
@@ -1013,14 +992,10 @@ class LogisticRegressionModel(ScoringModel):
     def add_feature_stat(df, clf, scoring, cv):
         features = list(df.columns)[1:]
         clf.fit(df[features], df.iloc[:, 0])
-        features_to_check = []
-        coefs_list = [clf.intercept_[0]]
-        for i, feature in enumerate(features):
-            if clf.coef_[0][i] != 0:
-                features_to_check.append(feature)
-                coefs_list.append(clf.coef_[0][i])
-            elif i == 0:
-                return 1, 0
+        if clf.coef_[0][0] == 0:
+            return 1, 0
+        coefs_list = [clf.intercept_[0]] + [c for c in clf.coef_[0] if c != 0]
+        features_to_check = [f for f, c in zip(features, clf.coef_[0]) if c != 0]
         try:
             # Calculate matrix of predicted class probabilities.
             # Check resLogit.classes_ to make sure that sklearn ordered your classes as expected
@@ -1035,36 +1010,28 @@ class LogisticRegressionModel(ScoringModel):
             wald=(coefs_list / bse) ** 2
             pvalue=chi2.sf(wald, 1)
             if scoring.upper() in ['AIC', 'BIC', 'SIC',  'SBIC']:
-                features_kept = []
-                weights_crit = [clf.intercept_[0]]
-                for i in range(len(features)):
-                    if clf.coef_[0][i] != 0:
-                        features_kept.append(features[i])
-                        weights_crit.append(clf.coef_[0][i])
-
                 intercept_crit = np.ones((df.shape[0], 1))
-                features_crit = np.hstack((intercept_crit, df[features_kept]))
-                scores_crit = np.dot(features_crit, weights_crit)
+                features_crit = np.hstack((intercept_crit, df[features_to_check]))
+                scores_crit = np.dot(features_crit, coefs_list)
                 ll = np.sum((df.iloc[:, 0] * scores_crit - np.log(np.exp(scores_crit) + 1)))
-
                 if scoring.upper() == 'AIC':
-                    score = 2 * len(weights_crit) - 2 * ll
+                    score = 2 * len(coefs_list) - 2 * ll
                 else:
-                    score = len(weights_crit) * np.log(df.shape[0]) - 2 * ll
+                    score = len(coefs_list) * np.log(df.shape[0]) - 2 * ll
                 score = -score
             else:
-                score = cross_val_score(clf, df[features], df.iloc[:, 0], cv=cv,
-                                        scoring=scoring if scoring != 'gini' else 'roc_auc').mean()
+                score = cross_val_score(clf, df[features], df.iloc[:, 0], cv=cv, scoring=scoring if scoring != 'gini' else 'roc_auc').mean()
                 if scoring == 'gini':
-                    score = (2 * score - 1)*100
+                    score = round((2 * score - 1)*100, 3)
         except:
             return 1, 0
         return pvalue[1], score
 
     def stepwise_selection(self, ds=None, verbose=False, selection_type='stepwise', features=None, hold=None,
-                           score_delta=0.01, scoring='gini', cv=None, pvalue_threshold=0.05, pvalue_priority=False):
+                           features_ini=None, limit_to_add=100, score_delta=0.01, scoring='gini', cv=None,
+                           pvalue_threshold=0.05, pvalue_priority=False):
         """
-         Итерационный отобор. Доступны три типа отбора:
+        Итерационный отобор. Доступны три типа отбора:
             selection_type='forward' - все доступные факторы помещаются в список кандидатов, на каждом шаге из списка кандидатов определяется лучший* фактор и перемещается в модель
             selection_type='backward' - в модель включаются все доступные факторы, затем на каждом шаге исключается худший* фактор
             selection_type='stepwise' - комбинация 'forward' и 'backward'. Каждый шаг состоит из двух этапов:
@@ -1085,19 +1052,22 @@ class LogisticRegressionModel(ScoringModel):
         :param selection_type: тип отбора. Варианты 'forward', 'backward', 'stepwise'
         :param features: исходный список переменных. При None берется self.features
         :param hold: список переменных, которые обязательно должны остаться после отбора
+        :param features_ini: список переменных, с которых стартует отбор. Они могут быть исключены в процессе отбора
+        :param limit_to_add: максимальное кол-во переменных, которые могут быть добавлены к модели
         :param score_delta: минимальный прирост метрики
         :param scoring: максимизируемая метрика.
                 Варианты значений: 'gini', 'AIC', 'BIC', 'SIC', 'SBIC' + все метрики доступные для вычисления через sklearn.model_selection.cross_val_score.
                 Все информационные метрики после вычисления умножаются на -1 для сохранения логики максимизации метрики.
+        :param cv: параметр cv для вычисления скора sklearn.model_selection.cross_val_score
         :param pvalue_threshold: граница значимости по p-value
         :param pvalue_priority: вариант определения лучшего фактора
 
         :return: кортеж (итоговый список переменных, график со скором в процессе отбора в виде объекта plt.figure)
         """
-        def add_feature(features, candidates, clf):
+        def add_feature(features, candidates, score, clf):
             cvs = {}
             pvalues = {}
-            candidates = [f for f in candidates if f not in features]
+            candidates = candidates - features
             if self.ds.n_jobs > 1:
                 jobs = {}
                 iterations = len(candidates)
@@ -1105,7 +1075,7 @@ class LogisticRegressionModel(ScoringModel):
                 with futures.ProcessPoolExecutor(max_workers=self.ds.n_jobs) as pool:
                     while iterations:
                         for feature in candidates_iter:
-                            jobs[pool.submit(self.add_feature_stat, df=self.ds.samples[self.ds.train_name][[self.ds.target, feature] + features], clf=clf, scoring=scoring, cv=cv)] = feature
+                            jobs[pool.submit(self.add_feature_stat, df=self.ds.samples[self.ds.train_name][[self.ds.target, feature] + list(features)], clf=clf, scoring=scoring, cv=cv)] = feature
                             if len(jobs) > self.ds.max_queue:
                                 break
                         for job in futures.as_completed(jobs):
@@ -1116,12 +1086,12 @@ class LogisticRegressionModel(ScoringModel):
                             break
             else:
                 for feature in candidates:
-                    tmp_features = features + [feature]
+                    tmp_features = list(features) + [feature]
                     clf.fit(self.ds.samples[self.ds.train_name][tmp_features], self.ds.samples[self.ds.train_name][self.ds.target])
                     cvs[feature] = self.get_score(scoring=scoring, cv=cv, features=tmp_features, clf=clf, fit=False)
                     try:
                         wald = self.wald_test(features=tmp_features, clf=clf, fit=False)
-                        pvalues[feature] = wald[wald['feature'] == feature]['p-value'].values[0]
+                        pvalues[feature] = wald[wald.index == feature]['p-value'].values[0]
                     except:
                         pvalues[feature] = 1
             if pvalues:
@@ -1132,157 +1102,128 @@ class LogisticRegressionModel(ScoringModel):
                 else:
                     features = [f for f in sorted(cvs, key=cvs.get, reverse=True) if
                                 pvalue_threshold is None or pvalues[f] < pvalue_threshold]
-                    if features and cvs[features[0]] - prev_score > score_delta:
+                    if features and cvs[features[0]] - score > score_delta:
                         feature = features[0]
                     else:
                         feature = None
                 if feature:
-                    return feature, round(cvs[feature], self.round_digits), pvalues[feature]
+                    return feature, cvs[feature], pvalues[feature]
             return None, None, None
 
-        def drop_feature(features, clf):
+        def drop_feature(features, hold, clf):
             # searching for the feature that increases the quality most
-            wald = self.wald_test(clf=clf, features=features, fit=True)
-            wald_to_check = wald[~wald['feature'].isin(hold + ['intercept'])]
+            wald = self.wald_test(clf=clf, features=list(features), fit=True)
+            wald_to_check = wald[~wald.index.isin(list(hold) + ['intercept'])]
             pvalue = wald_to_check['p-value'].max()
-            feature = wald_to_check[wald_to_check['p-value'] == pvalue]['feature'].values[0]
-            if pvalue < pvalue_threshold:
-                feature = None
-                score = None
-                pvalue = None
-            else:
-                score = self.get_score(scoring=scoring, cv=cv, features=[f for f in features if f != feature], clf=clf, fit=True)
+            if wald_to_check.empty or pvalue < pvalue_threshold:
+                return None, None, None
+            feature = wald_to_check[wald_to_check['p-value'] == pvalue].index.values[0]
+            score = self.get_score(scoring=scoring, cv=cv, features=list(features - {feature}), clf=clf, fit=True)
             return feature, score, pvalue
+
+        def ini_score(features):
+            if features:
+                score = self.get_score(scoring=scoring, cv=cv, features=list(features), fit=True)
+                graph = [(score, 'initial')]
+                if verbose:
+                    print(f'Initial features: {list(features)}, {scoring} score {score}')
+            else:
+                score = -1000000
+                graph = []
+            return score, graph
 
         if ds is not None:
             self.ds = ds
-        if hold is None:
-            hold = []
-        if features is None:
-            features = self.ds.features.copy()
-        scores = []
-        features_change = []
+
+        hold = set() if hold is None else set(hold)
+        features = set(self.ds.features) if features is None else set(features)
+        features_ini = hold if features_ini is None else set(features_ini) | hold
+        candidates = features - features_ini
+        if selection_type != 'backward' or features_ini != hold:
+            features = features_ini.copy()
+        score, graph = ini_score(features)
         # correctness check
-        for feature in hold:
-            if feature not in self.ds.features:
-                print(f'No {feature} in DataSample!')
+        for f in features | features_ini:
+            if f not in self.ds.samples[self.ds.train_name].columns:
+                print(f'No {f} in DataSample!')
                 return None
 
         if verbose:
             print(f'{selection_type.capitalize()} feature selection started...')
         # Forward selection
         if selection_type == 'forward':
-            candidates = [feature for feature in features if feature not in hold]
-            features = hold.copy()
-            if len(features) > 0:
-                prev_score = self.get_score(scoring=scoring, cv=cv, features=features, fit=True)
-                scores.append(prev_score)
-                features_change.append('initial')
-                if verbose:
-                    print('Initial features:', features, '', scoring, 'score', prev_score)
-            else:
-                prev_score = -1000000
             # maximum number of steps equals to the number of candidates
             for i in range(len(candidates)):
                 # cross-validation scores for each of the remaining candidates of the step
-                feature, score, pvalue = add_feature(features, candidates, self.clf)
+                feature, score, pvalue = add_feature(features, candidates, score, self.clf)
                 if feature is None:
                     break
                 if verbose:
                     print(f'To add: {feature}, {scoring}: {score}, p-value: {pvalue}')
-                prev_score = score
-                features.append(feature)
-                candidates.remove(feature)
-                scores.append(score)
-                features_change.append(f'+ {feature}')
+                features.add(feature)
+                graph.append((score, f'+ {feature}'))
+                if len(features - features_ini) >= limit_to_add:
+                    if verbose:
+                        print(f'Reached the limit of the number of added features in the model. Selection stopped.')
+                    break
 
         # Backward selection
         elif selection_type == 'backward':
-            candidates = [feature for feature in features if feature not in hold]
-            if len(features) > 0:
-                prev_score = self.get_score(scoring=scoring, cv=cv, features=features, fit=True)
-                scores.append(prev_score)
-                features_change.append('initial')
-                if verbose:
-                    print('Initial features:', features, '', scoring, 'score', prev_score)
-            else:
-                prev_score = -1000000
             # maximum number of steps equals to the number of candidates
             for i in range(len(candidates)):
-                feature, score, pvalue = drop_feature(features, self.clf)
+                feature, score, pvalue = drop_feature(features, hold, self.clf)
                 if feature is None:
                     break
                 if verbose:
                     print(f'To drop: {feature}, {scoring}: {score}, p-value: {pvalue}')
-                prev_score = score
                 features.remove(feature)
-                scores.append(score)
-                features_change.append(f'- {feature}')
+                graph.append((score, f'- {feature}'))
+                if len(features - features_ini) >= limit_to_add:
+                    if verbose:
+                        print(f'Reached the limit of the number of added features in the model. Selection stopped.')
+                    break
+
         # stepwise
         elif selection_type == 'stepwise':
-            candidates = [feature for feature in features if feature not in hold]
-            features = hold.copy()
-            if len(features) > 0:
-                score = self.get_score(scoring=scoring, cv=cv, features=features, fit=True)
-                scores.append(score)
-                features_change.append('initial')
-                feature_sets = [set(features)]
-            else:
-                score = -1000000
-                feature_sets = []
-            to_continue = True
-            prev_score = score
-            while to_continue and candidates:
-                to_continue = False
-                result_features = features.copy()
-                feature, score, pvalue = add_feature(features, candidates, self.clf)
+            feature_sets = [features.copy()]
+            for i in range(len(candidates)):
+                feature, score, pvalue = add_feature(features, candidates, score, self.clf)
                 if feature:
                     if verbose:
                         print(f'To add: {feature}, {scoring}: {score}, p-value: {pvalue}')
-                    features.append(feature)
-                    scores.append(score)
-                    prev_score = score
-                    features_change.append(f'+ {feature}')
-                    if set(features) in feature_sets:
-                        if verbose:
-                            print('Feature selection entered loop: terminating feature selection')
-                        break
-                    to_continue = True
-                    feature_sets.append(set(features))
-                if features == result_features:
-                    if verbose:
-                        print('No significant features to add were found')
-                # the least significant feature is removed
-                # if it is Step1 then no removal
-                if len(features) > 1:
-                    feature, score, pvalue = drop_feature(features, self.clf)
+                    features.add(feature)
+                    graph.append((score, f'+ {feature}'))
+                elif verbose:
+                    print('No significant features to add were found')
+                if features:
+                    feature, drop_score, pvalue = drop_feature(features, hold, self.clf)
                     if feature:
+                        score = drop_score
                         if verbose:
                             print(f'To drop: {feature}, {scoring}: {score}, p-value: {pvalue}')
-                        scores.append(score)
-                        prev_score = score
                         features.remove(feature)
-                        features_change.append(f'- {feature}')
-                        if set(features) in feature_sets:
-                            if verbose:
-                                print('Feature selection entered loop: terminating feature selection')
-                            break
-                        to_continue = True
-                        feature_sets.append(set(features))
-            features = sorted(list(feature_sets[-1]))
+                        graph.append((score, f'- {feature}'))
+                if features in feature_sets:
+                    break
+                feature_sets.append(features.copy())
+                if len(features - features_ini) >= limit_to_add:
+                    if verbose:
+                        print(f'Reached the limit of the number of added features in the model. Selection stopped.')
+                    break
+            features = feature_sets[-1]
         else:
             print('Incorrect kind of selection. Please use backward, forward or stepwise.')
             return None
-        fig = plt.figure(figsize=(max(len(features_change)//2, 5), 3))
-        plt.plot(np.arange(len(scores)), scores, 'bo-', linewidth=2.0)
-        plt.xticks(np.arange(len(features_change)), features_change, rotation=30, ha='right', fontsize=10)
+        fig = plt.figure(figsize=(max(len(graph)//2, 5), 3))
+        plt.plot(np.arange(len(graph)), [x[0] for x in graph], 'bo-', linewidth=2.0)
+        plt.xticks(np.arange(len(graph)), [x[1] for x in graph], rotation=30, ha='right', fontsize=10)
         plt.tick_params(axis='y', which='both', labelsize=10)
         plt.ylabel(scoring)
         plt.title(f'{selection_type.capitalize()} score changes')
         fig.tight_layout()
         if verbose:
             plt.show()
-        return features, fig
+        return list(features), fig
 
     def tree_selection(self, ds=None, selection_type='forward', model_type='xgboost', result_file='tree_selection.xlsx',
                        plot_pdp=False, verbose=False):
@@ -1463,69 +1404,25 @@ class LogisticRegressionModel(ScoringModel):
         :param sample_name: название сэмпла на котором проводится обучение. При None берется ds.train_sample
         :param features: список переменных. При None берется self.features
         """
-        if ds is None:
-            ds = self.ds
-        self.coefs = {}
-        self.intercept = None
+        if ds is not None:
+            self.ds = ds
         if features:
             self.features = features
         elif not self.features:
-            self.features = ds.features
-
+            self.features = self.ds.features
         if sample_name is None:
-            sample_name = ds.train_name
-
+            sample_name = self.ds.train_name
         try:
-            self.clf.fit(ds.samples[sample_name][self.features], ds.samples[sample_name][ds.target])
+            self.clf.fit(self.ds.samples[sample_name][self.features], self.ds.samples[sample_name][self.ds.target])
+            self.intercept = round(self.clf.intercept_[0], self.round_digits)
+            self.coefs = {f: round(c, self.round_digits) for f, c in zip(self.features, self.clf.coef_[0])}
+            print(f'intercept = {self.intercept}')
+            print(f'coefs = {self.coefs}')
         except Exception as e:
+            self.intercept = None
+            self.coefs = {}
             print(e)
             print('Fit failed!')
-            return None
-        self.intercept = round(self.clf.intercept_[0], self.round_digits)
-        for i in range(len(self.features)):
-            self.coefs[self.features[i]] = round(self.clf.coef_[0][i], self.round_digits)
-        print(f'intercept = {self.intercept}')
-        print(f'coefs = {self.coefs}')
-
-    def inf_criterion(self, ds=None, sample_name=None, clf=None, features=None, criterion='AIC'):
-        """
-        Расчет информационного критерия модели на заданной выборке
-        :param ds: ДатаСэмпл. При None берется self.ds
-        :param sample_name: название сэмпла. При None берется ds.train_sample
-        :param clf: модель (объект класса LogisticRegression). При None берется self.model
-        :param features: список переменных. При None берется self.features
-        :param criterion: критерий для расчета. Доступны варианты 'AIC', 'BIC'
-        :return: значение заданного криетрия
-        """
-        if ds is None:
-            ds = self.ds
-        if features is None:
-            if self.features:
-                features = self.features
-            else:
-                features = ds.features
-
-        if clf is None:
-            clf = self.clf
-
-        if sample_name is None:
-            sample_name = ds.train_name
-
-        features_kept = []
-        weights_crit = [clf.intercept_[0]]
-        for i in range(len(features)):
-            if clf.coef_[0][i] != 0:
-                features_kept.append(features[i])
-                weights_crit.append(clf.coef_[0][i])
-
-        intercept_crit = np.ones((ds.samples[sample_name].shape[0], 1))
-        features_crit = np.hstack((intercept_crit, ds.samples[sample_name][features_kept]))
-        scores_crit = np.dot(features_crit, weights_crit)
-        ll = np.sum(ds.samples[sample_name][ds.target] * scores_crit - np.log(np.exp(scores_crit) + 1))
-        if criterion in ['aic', 'AIC']:
-            return 2 * len(weights_crit) - 2 * ll
-        elif criterion in ['bic', 'BIC', 'sic', 'SIC', 'sbic', 'SBIC']:
-            return len(weights_crit) * np.log(ds.samples[sample_name].shape[0]) - 2 * ll
 
     def get_score(self, ds=None, sample_name=None, clf=None, cv=None, scoring='gini', features=None, fit=True):
         """
@@ -1542,32 +1439,21 @@ class LogisticRegressionModel(ScoringModel):
         """
         if ds is None:
             ds = self.ds
-
         if features is None:
             if self.features:
                 features = self.features
             else:
                 features = ds.features
-        
-        if features is None:
-            print ('No features, how can that happen? :(')
-            return None
-        
         if sample_name is None:
             sample_name = ds.train_name
-
         if clf is None:
             clf = self.clf
+
         if scoring.upper() in ['AIC', 'BIC', 'SIC',  'SBIC']:
             if fit:
                 clf.fit(ds.samples[sample_name][features], ds.samples[sample_name][ds.target])
-            features_kept = []
-            weights_crit = [clf.intercept_[0]]
-            for i in range(len(features)):
-                if clf.coef_[0][i] != 0:
-                    features_kept.append(features[i])
-                    weights_crit.append(clf.coef_[0][i])
-
+            features_kept = [f for f, c in zip(features, clf.coef_[0]) if c != 0]
+            weights_crit = [clf.intercept_[0]] + [c for c in clf.coef_[0] if c != 0]
             intercept_crit = np.ones((ds.samples[sample_name].shape[0], 1))
             features_crit = np.hstack((intercept_crit, ds.samples[sample_name][features_kept]))
             scores_crit = np.dot(features_crit, weights_crit)
@@ -1614,7 +1500,7 @@ class LogisticRegressionModel(ScoringModel):
             print(f'No calculated intercept and coefs in self, use self.fit() before. Return None')
         if data is not None:
             if isinstance(data, pd.DataFrame):
-                ds = DataSamples(samples={'train': data}, features=[rem_suffix(f) for f in self.coefs], cat_columns=[])
+                ds = DataSamples(samples={'train': data}, features=[], cat_columns=[])
             else:
                 ds = copy.deepcopy(data)
         else:
@@ -1634,11 +1520,12 @@ class LogisticRegressionModel(ScoringModel):
         result = '\n'
         if self.transformer is not None:
             for f_WOE in self.features:
-                f = f_WOE.rsplit('_WOE', maxsplit=1)[0]
-                result += self.transformer.feature_woes[f].get_transform_func(f"df['{f_WOE}'] = ", f"df['{f}']",
-                                                                              self.transformer.feature_woes[f].groups,
-                                                                              self.transformer.feature_woes[f].woes,
-                                                                              self.transformer.feature_woes[f].others_woe) + "\n"
+                f = rem_suffix(f_WOE)
+                if f in self.transformer.feature_woes:
+                    result += self.transformer.feature_woes[f].get_transform_func(f"df['{f_WOE}'] = ") + "\n"
+                elif is_cross(f):
+                    f1, f2 = cross_split(f)
+                    result += self.transformer.feature_crosses[f1].get_transform_func(f2, f"df['{f_WOE}'] = ") + "\n"
         result += f"df[{score_field}] = {self.intercept} + {' + '.join([f'''({c}) * df['{f}']''' for f, c in self.coefs.items()])}\n"
         if pd_field:
             result += f"df[{pd_field}] = 1 / (1 + np.exp(-df[{score_field}]))\n"
@@ -1686,11 +1573,10 @@ def scoring(df, score_field='score', pd_field='pd', scale_field=None):
         result += self.get_code(score_field='score_field' if score_field else None,
                                 pd_field='pd_field' if pd_field else None,
                                 scale_field='scale_field' if scale_field else None).replace('\n','\n    ')
-        result += f"    return df\n\n"
+        result += f"return df\n\n"
         result += f'''df = scoring(df, score_field={f"'{score_field}'" if score_field else None}, pd_field={f"'{pd_field}'" if pd_field else None}, scale_field={f"'{scale_field}'" if scale_field else None})'''
         if file_name:
-            if self.ds is not None:
-                file_name = self.ds.result_folder + file_name
+            file_name = add_ds_folder(self.ds, file_name)
             with open(file_name, 'w', encoding='utf-8') as file:
                 file.write(result)
             print(f'The model code for implementation saved to file {file_name}')
@@ -1712,369 +1598,6 @@ def scoring(df, score_field='score', pd_field='pd', scale_field=None):
             if filename is not None:
                 plt.savefig(filename, dpi=100, bbox_inches='tight')
             plt.show()
-#------------------------------------------------------------------------------------------------------------------
-
-
-class OrdinalRegressionModel:
-    '''
-    Ordinal logistic regression for acceptable probability models (mainly for income prediction). It predicts a probability
-    that real value is less or equal then the specified value or a value that would be less or equal then the real value with
-    the specified probability.
-
-    There is no ordinal regression in sklearn, so this class doesn't inherit sklearn's interface, but it has a similar one.
-
-    An object of this class can:
-    1) transform input continuous dependent variable into ordinal by defining classes,
-    2) fit separate logistic regressions for analysing the possibility of using ordinal regression (all coefficients by the same
-        variables must be "close" to each other) and guessing of initital parameters for ordinal regression,
-    3) fit ordinal regression, using scipy.optimize.minimize with SLSQP method and constraints, that class estimates should
-        be monotonically increasing, minimizing negative log-likelihood of separate logistic regressions,
-    4) fit linear regression for estimating class estimates by the natural logarithm of predicted value, using
-        scipy.optimize.minimize with the specified method, minimizing negative R-squared of this linear regression,
-    5) predict a probability that real value is less or equal then the specified value,
-    6) predict a value that would be less or equal then the real value with the specified probability,
-    7) create SAS code for calculating income, using fitted ordinal logistic and linear regressions.
-    '''
-
-    def __init__(self, X, y, classes=None, coefficients=None, intercepts=None, bias=None,
-                 log_intercept=None, log_coefficient=None, alpha=None):
-        '''
-        Parameters
-        -----------
-        X: pandas.Series containing the predictor variables
-        y: pandas.Series containing the dependent variable
-        classes: an array-like, containing the upper edges of classes of dependent variable
-        coefficients: the coefficients by the predictor variables
-        intercepts: an array-like with classes estimates
-        bias: a shift of the dependent variable used for more accurate prediction of classes estimates
-        log_intercept: an intercept for linear regression of classes estimates by classes upper edges
-        log_coefficient: a coefficient for linear regression of classes estimates by classes upper edges
-        alpha: a probability value used for predicting dependent variable lower edge
-        '''
-        if len(X.shape)==1:
-            X=pd.DataFrame(X)
-        if classes is None:
-            classes=[x*10000 for x in range(1,11)]
-
-        self.X=X
-        self.y=y
-        self.classes=classes
-        self.coefficients=coefficients
-        self.intercepts=intercepts
-        self.bias=bias
-        self.log_intercept=log_intercept
-        self.log_coefficient=log_coefficient
-        self.alpha=alpha
-
-
-    def y_to_classes(self, y=None, classes=None, replace=True):
-        '''
-        Transform continuous dependent variable to ordinal variable
-
-        Parameters
-        -----------
-        y: pandas.Series containing the dependent variable
-        classes: an array-like, containing the upper edges of classes of dependent variable
-        replace: should new ordinal variable replace initial continuous one in self
-
-        Returns
-        -----------
-        pandas.Series of transformed ordinal dependent variable
-        '''
-        if y is None:
-            y=self.y
-        if classes is None:
-            classes=self.classes
-
-        bins = pd.IntervalIndex.from_tuples([(-np.inf if i==0 else classes[i-1], np.inf if i==len(classes) else classes[i]) \
-                                             for i in range(len(classes)+1)], closed ='left')
-        #display(bins)
-        new_y=pd.cut(y, bins=bins).apply(lambda x: x.right).astype(float)
-        if replace:
-            self.y=new_y
-        return new_y
-
-
-    def fit(self, X=None, y=None, params=None, verbose=True):
-        '''
-        Fit ordinal logistic regression, using scipy.optimize.minimize with SLSQP method and constraints
-        of inequality defined as differences between the estimates of the next and current classes (these
-        differences will stay non-negative for SLSQP method)
-
-        Parameters
-        -----------
-        X: pandas.Series containing the predictor variables
-        y: pandas.Series containing the dependent variable
-        params: an array-like with predictor's coefficient and classes estimates
-        verbose: should detailed information be printed
-        '''
-
-        def get_guess(X, y, verbose=True):
-            '''
-            TECH
-
-            Find initial coefficients and classes estimates values by fitting separate logistic regressions
-
-            Parameters
-            -----------
-            X: pandas.Series containing the predictor variables
-            y: pandas.Series containing the dependent variable
-            verbose: should detailed information be printed
-
-            Returns
-            -----------
-            an array-like with predictors' coefficients and classes estimates initial values
-            '''
-            lr_coefs=pd.DataFrame(columns=list(X.columns)+['intercept', 'amount', 'gini'])
-            for target in self.classes:
-                check_class=(y<=target)
-                lr=LogisticRegression(C=100000, random_state=40)
-                lr.fit(X, check_class)
-                fpr, tpr, _ = roc_curve(check_class, lr.predict_proba(X)[:,1])
-
-                lr_coefs.loc[target]=list(lr.coef_[0])+[lr.intercept_[0], check_class.sum(), 2*auc(fpr, tpr)-1]
-            if verbose:
-                for pred in X.columns:
-                    plt.figure(figsize = (10,5))
-                    plt.barh(range(lr_coefs.shape[0]), lr_coefs[pred].tolist())
-                    for i in range(lr_coefs.shape[0]):
-                        plt.text(lr_coefs[pred].tolist()[i], i, str(round(lr_coefs[pred].tolist()[i],5)),
-                                 horizontalalignment='left', verticalalignment='center', fontweight='bold', fontsize=10)
-                    plt.yticks(range(lr_coefs.shape[0]), lr_coefs.index.tolist())
-                    plt.suptitle('Coefficients of separate logistic regressions')
-                    plt.xlabel('Coefficients for predictor '+pred)
-                    plt.ylabel('Predicted value caps (classes)')
-                    plt.margins(x=0.1)
-                    plt.show()
-                plt.figure(figsize = (10,5))
-                plt.bar(range(lr_coefs.shape[0]), lr_coefs.gini.tolist())
-                for i in range(lr_coefs.shape[0]):
-                    plt.text(i, lr_coefs.gini.tolist()[i], str(round(lr_coefs.gini.tolist()[i],4)),
-                             horizontalalignment='center', verticalalignment='bottom', fontweight='bold', fontsize=10)
-                plt.xticks(range(lr_coefs.shape[0]), lr_coefs.index.tolist())
-                plt.suptitle('Gini values of separate logistic regressions')
-                plt.ylabel('Gini value')
-                plt.xlabel('Predicted value caps (classes)')
-                plt.margins(y=0.1)
-                plt.show()
-            return np.array(lr_coefs[list(X.columns)].mean().tolist()+lr_coefs.intercept.tolist())
-
-        if X is None:
-            X=self.X
-        if y is None:
-            y=self.y
-
-        if params is None:
-            if verbose:
-                print('No initial parameters specified. Guessing approximate parameters by fitting separate logistic regressions..')
-            guess=get_guess(X, y, verbose=verbose)
-            if verbose:
-                print('Initial guess:')
-                print('\tCoefficients (<predictor> = <coefficient>):')
-                for i in range(len(X.columns)):
-                    print('\t',X.columns[i],'=',guess[i])
-                print('\tClass estimates (<class> = <estimate>):')
-                for i in range(len(self.classes)):
-                    print('\t',self.classes[i],'=',guess[i+len(X.columns)])
-                print()
-        else:
-            guess=params.copy()
-
-
-        cons=tuple({'type': 'ineq', 'fun': lambda x:  x[i+1] - x[i]} for i in range(len(X.columns),len(X.columns)+len(self.classes)-1))
-
-        results = minimize(self.OrdinalRegressionLL, guess, args=(X, y),
-                           method = 'SLSQP', options={'disp': verbose}, constraints=cons)
-
-        self.coefficients=results['x'][:len(X.columns)]
-        self.intercepts=list(results['x'][len(X.columns):])
-        if verbose:
-            print()
-            print('Fitted values:')
-            print('\tCoefficients (<predictor> = <coefficient>):')
-            for i in range(len(X.columns)):
-                print('\t',X.columns[i],'=',self.coefficients[i])
-            print('\tClass estimates (<class> = <estimate>):')
-            for i in range(len(self.classes)):
-                print('\t',self.classes[i],'=',self.intercepts[i])
-
-
-    def fit_class_estimates(self, bias=None, verbose=True, method='Nelder-Mead'):
-        '''
-        Fit linear regression, using scipy.optimize.minimize with the specified method. Nelder-Mead showed
-        the best results during testing.
-
-        Parameters
-        -----------
-        bias: a shift of the dependent variable used for more accurate prediction of classes estimates
-        verbose: should detailed information be printed
-        method: optimization method for finding the best bias value
-        '''
-        to_log=pd.DataFrame([self.classes, self.intercepts], index=['value', 'estimate']).T
-
-        if bias is None:
-            if verbose:
-                print('Searching for an optimal bias value..')
-            results = minimize(self.LinearRegressionR2, [0], args=(to_log.value, to_log.estimate),
-                               method=method, options={'disp': verbose})
-            self.bias=results['x'][0]
-        else:
-            self.bias=bias
-
-        biased_X=np.log(to_log.value+self.bias)
-        lir=LinearRegression()
-        lir.fit(biased_X.reshape(-1,1), to_log.estimate)
-        self.log_intercept=lir.intercept_
-        self.log_coefficient=lir.coef_[0]
-
-        r2=r2_score(to_log.estimate, lir.predict(biased_X.reshape(-1,1)))
-
-        if verbose:
-            fig = plt.figure(figsize=(10,5))
-            ax = fig.add_subplot(111)
-            ax.scatter(y=to_log.estimate, x=to_log.value, label='Actual estimates')
-            ax.plot(to_log.value, lir.predict(biased_X.reshape(-1,1)), 'r-', label='Predicted estimates')
-            ax.text(0.95, 0.1,
-                    'y = '+str(round(self.log_coefficient,5))+'*ln(x+'+str(round(self.bias,5))+') '+\
-                        ('+ ' if self.log_intercept>=0 else '')+str(round(self.log_intercept,5)),
-                    horizontalalignment='right', verticalalignment='bottom', transform=ax.transAxes, fontsize=12,
-                    bbox=dict(facecolor='red', alpha=0.7))
-            ax.set_xlabel('Predicted value caps (classes)')
-            ax.set_ylabel('Classes estimates')
-            ax.legend()
-            plt.show()
-            print('Bias =', self.bias, 'R2_score =', r2)
-
-
-    def predict(self, alpha=None, X=None):
-        '''
-        Predict a value that would be less or equal then the real value with the specified probability
-
-        Parameters
-        -----------
-        X: pandas.Series containing the predictor variable
-        alpha: a probability value used for predicting dependent variable lower edge
-
-        Returns
-        -----------
-        pandas.Series of predicted values
-        '''
-        if X is None:
-            X=self.X
-        if alpha is not None:
-            self.alpha=alpha
-        elif alpha is None:
-            alpha=self.alpha
-        return np.exp((np.log((1-alpha)/alpha) - (self.coefficients*X).sum(axis=1) - self.log_intercept)/self.log_coefficient) - self.bias
-
-
-    def predict_proba(self, predicted_value, X=None):
-        '''
-        Predict a probability that real value is less or equal then the specified value
-
-        Parameters
-        -----------
-        predicted_value: a value to be used as the upper edge of predicted values in probability calculation
-        X: pandas.Series containing the predictor variable
-
-        Returns
-        -----------
-        pandas.Series of predicted probabilities
-        '''
-        if X is None:
-            X=self.X
-
-        if self.log_intercept is None or self.log_coefficient is None:
-            print('Class estimates were not fitted, only initial class values are available for prediction.')
-            class_num=np.argmin(np.abs(np.array(self.classes)-predicted_value))
-            predicted_value=self.classes[class_num]
-            intercept=self.intercepts[class_num]
-            print('Using', predicted_value,'instead of input value.')
-            return 1/(1+np.exp(-((self.coefficients*X).sum(axis=1)+intercept)))
-        else:
-            intercept=self.log_coefficient*np.log(predicted_value+self.bias)+self.log_intercept
-            return 1/(1+np.exp(-((self.coefficients*X).sum(axis=1)+intercept)))
-
-
-    def to_sas(self, alpha=None):
-        '''
-        Print SAS code with income calculation formula
-
-        Parameters
-        -----------
-        alpha: a probability value used for predicting dependent variable lower edge
-        '''
-        if alpha is None:
-            alpha=self.alpha
-        print('BIAS =', self.bias,';')
-        print('INCOME_INTERCEPT =', self.log_intercept,';')
-        print('INCOME_COEF =', self.log_coefficient,';')
-        for i in range(len(self.X.columns)):
-            print(self.X.columns[i]+'_COEF =', self.coefficients[i],';')
-        print('ALPHA =', alpha,';')
-        print()
-        final_formula='INCOME_FORECAST = exp((log((1-ALPHA)/ALPHA)'
-        for i in range(len(self.X.columns)):
-            final_formula+=' - '+self.X.columns[i]+'_COEF*'+self.X.columns[i]
-        final_formula+=' - INCOME_INTERCEPT)/INCOME_COEF) - BIAS;'
-        print(final_formula)
-
-
-    def OrdinalRegressionLL(self, params, X=None, y=None):
-        '''
-        Returns negative summed up log-likelihood of separate logistic regressions for MLE
-
-        Parameters
-        -----------
-        params: an array-like with predictors' coefficients and classes estimates
-        X: pandas.Series containing the predictor variables
-        y: pandas.Series containing the dependent variable
-
-        Returns
-        -----------
-        negative summed up log-likelihood
-        '''
-        if X is None:
-            X=self.X
-        if y is None:
-            y=self.y
-
-        negLL = 0
-        #calculate and sum up log-likelyhood for each class as if it is a separate model
-        for i in range(len(self.classes)):
-            #taking class intercept and the common coefficients
-            weights=[params[i+len(self.X.columns)]]
-            for p in range(len(self.X.columns)):
-                weights.append(params[p])
-
-            intercept = np.ones((X.shape[0], 1))
-            features = np.hstack((intercept, X))
-            scores = np.dot(features, weights)
-            negLL -= np.sum((y<=self.classes[i])*scores - np.log(np.exp(scores) + 1))
-        # return negative LL
-        return negLL
-
-    def LinearRegressionR2(self, params, X, y):
-        '''
-        Returns negative R-squared of linear regression for minimizing
-
-        Parameters
-        -----------
-        params: an array-like with the bias value
-        X: pandas.Series containing the predictor variable
-        y: pandas.Series containing the dependent variable
-
-        Returns
-        -----------
-        negative R-squared
-        '''
-        biased_X=np.log(X+params[0])
-
-        lir=LinearRegression()
-        lir.fit(biased_X.reshape(-1,1), y)
-
-        return - r2_score(y, lir.predict(biased_X.values.reshape(-1,1)))
-
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
